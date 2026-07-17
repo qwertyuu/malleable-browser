@@ -1,0 +1,35 @@
+{
+  "name": "malleable-browser",
+  "version": "0.1.0",
+  "description": "A web browser you reshape on the fly by asking Claude, wired through the Agent Client Protocol.",
+  "type": "module",
+  "main": "out/main/index.js",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "^0.59.0",
+    "@agentclientprotocol/sdk": "^1.2.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "react-markdown": "^9.1.0",
+    "remark-gfm": "^4.0.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "^43.1.1",
+    "electron-vite": "^5.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "typescript": "^5.7.0",
+    "vite": "^7.0.0"
+  }
+}

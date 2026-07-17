@@ -1,0 +1,14 @@
+node_modules/
+out/
+dist/
+logs/
+.malleable/
+# User artifacts live in the app's userData workspace, never the repo. Ignore
+# these in case a workspace is ever pointed here.
+adaptations/
+tools/
+*.tsbuildinfo
+.DS_Store
+*.log
+.env
+.env.local
