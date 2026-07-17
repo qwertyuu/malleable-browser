@@ -34,6 +34,10 @@ export const IPC = {
   setEditEnabled: 'lib:setEditEnabled',
   deleteEdit: 'lib:deleteEdit',
 
+  // Agent-scaffolded tools (global + per-site).
+  listTools: 'lib:listTools',
+  deleteTool: 'lib:deleteTool',
+
   // Checkpoint / revert (safety net).
   revertLast: 'checkpoint:revertLast',
   listCheckpoints: 'checkpoint:list',
@@ -176,6 +180,26 @@ export interface EditContent extends EditMeta {
 
 /** Suggested categories (free-form; agent may use others). */
 export const EDIT_KINDS = ['theme', 'layout', 'functionality', 'cleanup', 'other'] as const
+
+/** A scaffolded MCP tool, for the library view. */
+export interface ToolParamDTO {
+  type: string
+  description?: string
+  required?: boolean
+}
+export interface ToolSummary {
+  name: string
+  description: string
+  scope: 'global' | 'site'
+  host?: string
+  params: Record<string, ToolParamDTO>
+  code: string
+}
+export interface ToolLibrary {
+  global: ToolSummary[]
+  /** host -> its site tools */
+  sites: Record<string, ToolSummary[]>
+}
 
 export interface PermissionOptionDTO {
   optionId: string

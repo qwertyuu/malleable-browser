@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { HostAdaptations, EditContent } from '../../../shared/ipc'
+import type { HostAdaptations, EditContent, ToolLibrary, ToolSummary } from '../../../shared/ipc'
 
 interface Props {
   visible: boolean
@@ -7,15 +7,20 @@ interface Props {
   onAskAgent: (host: string, text: string) => void
 }
 
-/** The adaptation library: every site's named edits, toggle/edit/delete by hand or agent. */
+const EMPTY_TOOLS: ToolLibrary = { global: [], sites: {} }
+
+/** The library: per-site named edits + the agent's scaffolded tools (global & site). */
 export default function LibraryView({ visible, busy, onAskAgent }: Props) {
   const [hosts, setHosts] = useState<HostAdaptations[]>([])
+  const [tools, setTools] = useState<ToolLibrary>(EMPTY_TOOLS)
   const [editing, setEditing] = useState<EditContent | null>(null)
   const [dirty, setDirty] = useState(false)
   const [ask, setAsk] = useState('')
 
   const refresh = useCallback(async () => {
-    setHosts(await window.api.listAdaptations())
+    const [h, t] = await Promise.all([window.api.listAdaptations(), window.api.listTools()])
+    setHosts(h)
+    setTools(t)
   }, [])
 
   useEffect(() => {
@@ -44,7 +49,7 @@ export default function LibraryView({ visible, busy, onAskAgent }: Props) {
     await refresh()
   }, [editing, refresh])
 
-  // ---- Editor view ----
+  // ---- Editor view (edits) ----
   if (editing) {
     const patch = (p: Partial<EditContent>): void => {
       setEditing({ ...editing, ...p })
@@ -124,71 +129,137 @@ export default function LibraryView({ visible, busy, onAskAgent }: Props) {
     )
   }
 
-  // ---- List view (grouped by host) ----
+  // ---- List view ----
+  const hostsWithEdits = new Map(hosts.map((h) => [h.host, h]))
+  const allHosts = Array.from(
+    new Set([...hosts.map((h) => h.host), ...Object.keys(tools.sites)])
+  ).sort()
+  const empty = allHosts.length === 0 && tools.global.length === 0
+
   return (
     <div className="library">
       <div className="library-head">
         <span>
-          {hosts.length} adapted site{hosts.length === 1 ? '' : 's'}
+          {allHosts.length} site{allHosts.length === 1 ? '' : 's'}
         </span>
         <button className="link-btn" onClick={refresh}>
           Refresh
         </button>
       </div>
-      {hosts.length === 0 && (
+
+      {empty && (
         <div className="hint">
-          No adaptations yet. Reshape a page from the Adapt tab and its edits show up here.
+          Nothing yet. Reshape a page or let the agent build a tool from the Adapt tab.
         </div>
       )}
-      {hosts.map((h) => (
-        <div className="lib-host-group" key={h.host}>
-          <button
-            className="lib-host-name"
-            title={`Open ${h.host}`}
-            onClick={() => window.api.navigate(`https://${h.host}/`)}
-          >
-            {h.host} <span className="visit-arrow">↗</span>
-          </button>
-          {h.edits.map((e) => (
-            <div className={`lib-row ${e.enabled ? '' : 'disabled'}`} key={e.id}>
-              <label className="switch" title={e.enabled ? 'Enabled' : 'Disabled'}>
-                <input
-                  type="checkbox"
-                  checked={e.enabled}
-                  onChange={async (ev) => {
-                    await window.api.setEditEnabled(h.host, e.id, ev.target.checked)
-                    await refresh()
-                  }}
-                />
-                <span className="slider" />
-              </label>
-              <div className="lib-main" onClick={() => open(h.host, e.id)}>
-                <div className="lib-edit-name">
-                  {e.name} <span className={`kind-badge kind-${e.kind}`}>{e.kind}</span>
-                </div>
-                <div className="lib-meta">
-                  {e.hasCss && <span className="chip">css</span>}
-                  {e.hasJs && <span className="chip">js</span>}
-                  <span className="lib-bytes">{formatBytes(e.bytes)}</span>
-                </div>
-              </div>
-              <button className="link-btn" onClick={() => open(h.host, e.id)}>
-                Edit
-              </button>
-              <button
-                className="link-btn danger"
-                onClick={async () => {
-                  await window.api.deleteEdit(h.host, e.id)
-                  await refresh()
-                }}
-              >
-                Delete
-              </button>
-            </div>
+
+      {tools.global.length > 0 && (
+        <div className="lib-host-group">
+          <div className="lib-host-name" style={{ cursor: 'default' }}>
+            ⦿ Global tools
+          </div>
+          {tools.global.map((t) => (
+            <ToolRow key={t.name} tool={t} onDeleted={refresh} />
           ))}
         </div>
-      ))}
+      )}
+
+      {allHosts.map((host) => {
+        const h = hostsWithEdits.get(host)
+        const siteTools = tools.sites[host] ?? []
+        return (
+          <div className="lib-host-group" key={host}>
+            <button
+              className="lib-host-name"
+              title={`Open ${host}`}
+              onClick={() => window.api.navigate(`https://${host}/`)}
+            >
+              {host} <span className="visit-arrow">↗</span>
+            </button>
+            {h?.edits.map((e) => (
+              <div className={`lib-row ${e.enabled ? '' : 'disabled'}`} key={e.id}>
+                <label className="switch" title={e.enabled ? 'Enabled' : 'Disabled'}>
+                  <input
+                    type="checkbox"
+                    checked={e.enabled}
+                    onChange={async (ev) => {
+                      await window.api.setEditEnabled(host, e.id, ev.target.checked)
+                      await refresh()
+                    }}
+                  />
+                  <span className="slider" />
+                </label>
+                <div className="lib-main" onClick={() => open(host, e.id)}>
+                  <div className="lib-edit-name">
+                    {e.name} <span className={`kind-badge kind-${e.kind}`}>{e.kind}</span>
+                  </div>
+                  <div className="lib-meta">
+                    {e.hasCss && <span className="chip">css</span>}
+                    {e.hasJs && <span className="chip">js</span>}
+                    <span className="lib-bytes">{formatBytes(e.bytes)}</span>
+                  </div>
+                </div>
+                <button className="link-btn" onClick={() => open(host, e.id)}>
+                  Edit
+                </button>
+                <button
+                  className="link-btn danger"
+                  onClick={async () => {
+                    await window.api.deleteEdit(host, e.id)
+                    await refresh()
+                  }}
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+            {siteTools.map((t) => (
+              <ToolRow key={t.name} tool={t} onDeleted={refresh} />
+            ))}
+          </div>
+        )
+      })}
     </div>
+  )
+}
+
+/** A scaffolded tool: expandable to show params + code, with delete. */
+function ToolRow({ tool, onDeleted }: { tool: ToolSummary; onDeleted: () => void }) {
+  const params = Object.entries(tool.params ?? {})
+  return (
+    <details className="lib-tool">
+      <summary>
+        <span className="tool-cog">⚙</span>
+        <span className="lib-tool-name">{tool.name}</span>
+        <span className="tool-badge">tool</span>
+        {params.length > 0 && <span className="lib-tool-params">{params.length}p</span>}
+        <button
+          className="link-btn danger"
+          onClick={async (e) => {
+            e.preventDefault()
+            await window.api.deleteTool(tool.name, tool.scope, tool.host)
+            onDeleted()
+          }}
+        >
+          Delete
+        </button>
+      </summary>
+      <div className="lib-tool-body">
+        {tool.description && <p className="lib-tool-desc">{tool.description}</p>}
+        {params.length > 0 && (
+          <ul className="lib-tool-plist">
+            {params.map(([k, p]) => (
+              <li key={k}>
+                <code>{k}</code>: {p.type}
+                {p.required ? ' (required)' : ''}
+                {p.description ? ` — ${p.description}` : ''}
+              </li>
+            ))}
+          </ul>
+        )}
+        <pre className="raw">{tool.code}</pre>
+      </div>
+    </details>
   )
 }
 

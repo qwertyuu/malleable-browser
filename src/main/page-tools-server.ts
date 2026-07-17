@@ -26,6 +26,10 @@ export interface PageToolsHandle {
   url: string
   token: string
   close: () => void
+  /** Re-scope site tools on all live sessions when the page host changes. */
+  syncSiteTools: (host: string | null) => void
+  /** Re-sync all tools with disk on all live sessions (after library edits). */
+  refreshTools: () => void
 }
 
 const jsonResult = (data: unknown) => ({
@@ -53,19 +57,77 @@ function registerDynamic(
  * Build a fresh MCP server: static page tools, the meta-tools that let the agent
  * scaffold new tools at runtime, and any dynamic tools already on disk.
  */
-async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<McpServer> {
+interface BuiltServer {
+  server: McpServer
+  /** Re-sync the site-scoped tools to a given host (called on navigation). */
+  reconcile: (host: string | null) => Promise<void>
+  /** Re-sync both global and site tools with disk (after library edits). */
+  reloadAll: () => Promise<void>
+}
+
+async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<BuiltServer> {
   const { inspector, adaptations, currentUrl, reloadCurrent, log } = deps
   const server = new McpServer({ name: 'malleable-page', version: '0.1.0' })
-  // name -> live registration, so define/remove can update in place.
+  // name -> live registration. Global tools are always present; site tools track
+  // the current host and are swapped as you navigate.
   const registered = new Map<string, RegisteredTool>()
+  const siteRegistered = new Map<string, RegisteredTool>()
+  let currentSiteHost: string | null = null
+
+  const hostNow = (): string | null => adaptations.slugFor(currentUrl())
 
   // Resolve the target host for an adaptation tool (defaults to current page).
   const resolveHost = (host?: string): string => {
-    const h = host ?? adaptations.slugFor(currentUrl())
+    const h = host ?? hostNow()
     if (!h) throw new Error('No host: load a page or pass an explicit host')
     return h
   }
-  const isCurrent = (host: string): boolean => adaptations.slugFor(currentUrl()) === host
+  const isCurrent = (host: string): boolean => hostNow() === host
+
+  // Swap the site-scoped tool set to `host`, firing tools/list_changed if it changed.
+  const reconcileSiteTools = async (host: string | null): Promise<void> => {
+    const before = new Set(siteRegistered.keys())
+    for (const t of siteRegistered.values()) t.remove()
+    siteRegistered.clear()
+    if (host) {
+      for (const def of await dynamic.listSite(host)) {
+        try {
+          siteRegistered.set(def.name, registerDynamic(server, def, inspector, log))
+        } catch (err) {
+          log('warn', 'tool.load.error', { name: def.name, err: String((err as any)?.message ?? err) })
+        }
+      }
+    }
+    currentSiteHost = host
+    const after = new Set(siteRegistered.keys())
+    const changed = before.size !== after.size || [...after].some((n) => !before.has(n))
+    if (changed) server.sendToolListChanged()
+  }
+
+  // Re-sync global tools with disk (add new, drop deleted). Used after library edits.
+  const reconcileGlobalTools = async (): Promise<void> => {
+    const disk = new Map((await dynamic.listGlobal()).map((d) => [d.name, d]))
+    let changed = false
+    for (const [name, t] of registered) {
+      if (!disk.has(name)) {
+        t.remove()
+        registered.delete(name)
+        changed = true
+      }
+    }
+    for (const [name, def] of disk) {
+      if (!registered.has(name)) {
+        registered.set(name, registerDynamic(server, def, inspector, log))
+        changed = true
+      }
+    }
+    if (changed) server.sendToolListChanged()
+  }
+
+  const reloadAll = async (): Promise<void> => {
+    await reconcileGlobalTools()
+    await reconcileSiteTools(hostNow())
+  }
 
   // ---- Static page tools ----
   server.registerTool(
@@ -130,32 +192,51 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
     'define_tool',
     {
       description:
-        'Create (or replace) a NEW tool that becomes available immediately. The tool body runs as JavaScript in the live page with an `args` object in scope; use `return` to produce output. This is how you extend your own capabilities into a reusable harness over this site.',
+        'Create (or replace) a NEW tool that becomes available immediately. The tool body runs as JavaScript in the live page with an `args` object in scope; use `return` to produce output. Scope "site" (default) makes it a durable harness for the current host, loaded only there; "global" makes it available everywhere.',
       inputSchema: {
         name: z.string().describe('lowercase name, e.g. extract_products'),
         description: z.string().describe('what the tool does + when to use it'),
         inputSchema: z
           .record(z.string(), paramSpec)
           .describe('param name -> {type, description?, required?}'),
-        code: z.string().describe('JS body; has `args`; use return to produce a value')
+        code: z.string().describe('JS body; has `args`; use return to produce a value'),
+        scope: z.enum(['site', 'global']).optional().describe('default: site (current host)')
       }
     },
-    async ({ name, description, inputSchema, code }) => {
+    async ({ name, description, inputSchema, code, scope }) => {
       try {
         dynamic.validateName(name)
+        const isSite = (scope ?? 'site') === 'site'
+        const host = isSite ? resolveHost() : undefined
         const def: DynamicToolDef = {
           name,
           description,
           inputSchema: (inputSchema ?? {}) as Record<string, ParamSpec>,
           code,
-          createdAt: Date.now()
+          createdAt: Date.now(),
+          scope: isSite ? 'site' : 'global',
+          host
         }
         await dynamic.save(def)
-        registered.get(name)?.remove()
-        registered.set(name, registerDynamic(server, def, inspector, log))
+        if (isSite) {
+          // Register live only if it's for the host currently on screen.
+          if (host === currentSiteHost) {
+            siteRegistered.get(name)?.remove()
+            siteRegistered.set(name, registerDynamic(server, def, inspector, log))
+          }
+        } else {
+          registered.get(name)?.remove()
+          registered.set(name, registerDynamic(server, def, inspector, log))
+        }
         server.sendToolListChanged()
-        log('info', 'tool.define', { name })
-        return jsonResult({ ok: true, name, message: `Tool "${name}" is now available.` })
+        log('info', 'tool.define', { name, scope: def.scope, host })
+        return jsonResult({
+          ok: true,
+          name,
+          scope: def.scope,
+          host,
+          message: `Tool "${name}" (${def.scope}) is now available.`
+        })
       } catch (err) {
         return { isError: true, content: [{ type: 'text' as const, text: String((err as any)?.message ?? err) }] }
       }
@@ -164,28 +245,50 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
 
   server.registerTool(
     'remove_tool',
-    { description: 'Delete a previously defined dynamic tool.', inputSchema: { name: z.string() } },
-    async ({ name }) => {
-      registered.get(name)?.remove()
-      registered.delete(name)
-      await dynamic.remove(name)
+    {
+      description: 'Delete a dynamic tool. Defaults to the current site scope; pass scope:"global" to remove a global one.',
+      inputSchema: {
+        name: z.string(),
+        scope: z.enum(['site', 'global']).optional()
+      }
+    },
+    async ({ name, scope }) => {
+      const isSite = (scope ?? (siteRegistered.has(name) ? 'site' : 'global')) === 'site'
+      if (isSite) {
+        siteRegistered.get(name)?.remove()
+        siteRegistered.delete(name)
+        await dynamic.remove(name, 'site', currentSiteHost ?? undefined)
+      } else {
+        registered.get(name)?.remove()
+        registered.delete(name)
+        await dynamic.remove(name, 'global')
+      }
       server.sendToolListChanged()
-      log('info', 'tool.remove', { name })
-      return jsonResult({ ok: true, removed: name })
+      log('info', 'tool.remove', { name, scope: isSite ? 'site' : 'global' })
+      return jsonResult({ ok: true, removed: name, scope: isSite ? 'site' : 'global' })
     }
   )
 
   server.registerTool(
     'list_tools',
-    { description: 'List the dynamic tools you have defined.', inputSchema: {} },
-    async () =>
-      jsonResult(
-        (await dynamic.list()).map((d) => ({
-          name: d.name,
-          description: d.description,
-          params: d.inputSchema
-        }))
-      )
+    { description: 'List your dynamic tools: the global ones and this site\'s ones.', inputSchema: {} },
+    async () => {
+      const globals = (await dynamic.listGlobal()).map((d) => ({
+        name: d.name,
+        scope: 'global',
+        description: d.description,
+        params: d.inputSchema
+      }))
+      const site = currentSiteHost
+        ? (await dynamic.listSite(currentSiteHost)).map((d) => ({
+            name: d.name,
+            scope: `site:${currentSiteHost}`,
+            description: d.description,
+            params: d.inputSchema
+          }))
+        : []
+      return jsonResult([...globals, ...site])
+    }
   )
 
   // ---- Adaptation library: many named, toggleable edits per site ----
@@ -264,15 +367,17 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
   )
 
   // ---- Load persisted dynamic tools ----
-  for (const def of await dynamic.list()) {
+  // Global tools are always registered; site tools track the current host.
+  for (const def of await dynamic.listGlobal()) {
     try {
       registered.set(def.name, registerDynamic(server, def, inspector, log))
     } catch (err) {
       log('warn', 'tool.load.error', { name: def.name, err: String((err as any)?.message ?? err) })
     }
   }
+  await reconcileSiteTools(hostNow())
 
-  return server
+  return { server, reconcile: reconcileSiteTools, reloadAll }
 }
 
 function readBody(req: IncomingMessage): Promise<unknown> {
@@ -300,6 +405,9 @@ export async function startPageToolsServer(deps: PageToolsDeps): Promise<PageToo
   const token = randomUUID()
   const dynamic = new DynamicTools(workspace)
   const transports = new Map<string, StreamableHTTPServerTransport>()
+  // Live servers, so navigation/library edits can re-scope their tools.
+  const servers = new Set<BuiltServer>()
+  let lastHost: string | null = null
 
   const httpServer = createServer(async (req, res) => {
     if (!req.url || !req.url.startsWith('/mcp')) return void res.writeHead(404).end()
@@ -321,11 +429,13 @@ export async function startPageToolsServer(deps: PageToolsDeps): Promise<PageToo
               transports.set(id, transport!)
             }
           })
+          const built = await buildServer(deps, dynamic)
+          servers.add(built)
           transport.onclose = () => {
             if (transport!.sessionId) transports.delete(transport!.sessionId)
+            servers.delete(built)
           }
-          const server = await buildServer(deps, dynamic)
-          await server.connect(transport)
+          await built.server.connect(transport)
         }
         await transport.handleRequest(req, res, body)
       } else {
@@ -345,5 +455,14 @@ export async function startPageToolsServer(deps: PageToolsDeps): Promise<PageToo
   const url = `http://127.0.0.1:${port}/mcp`
   log('info', 'mcp.server.start', { url })
 
-  return { url, token, close: () => httpServer.close() }
+  const syncSiteTools = (host: string | null): void => {
+    if (host === lastHost) return
+    lastHost = host
+    for (const b of servers) void b.reconcile(host)
+  }
+  const refreshTools = (): void => {
+    for (const b of servers) void b.reloadAll()
+  }
+
+  return { url, token, close: () => httpServer.close(), syncSiteTools, refreshTools }
 }

@@ -9,6 +9,7 @@ import { SessionStore } from './sessions.js'
 import { Logger } from './logger.js'
 import { PageInspector } from './page-inspector.js'
 import { startPageToolsServer, type PageToolsHandle } from './page-tools-server.js'
+import { DynamicTools } from './dynamic-tools.js'
 import { loadPersona, seedPersona } from './persona.js'
 import { AppSettings } from './app-settings.js'
 import {
@@ -33,6 +34,7 @@ let contentView: WebContentsView | null = null
 let acp: AcpClient | null = null
 const checkpoints = new Checkpoints(WORKSPACE)
 const adaptations = new Adaptations(WORKSPACE)
+const dynamicTools = new DynamicTools(WORKSPACE)
 const sessions = new SessionStore(WORKSPACE)
 const logger = new Logger(join(WORKSPACE, 'logs'))
 const pageInspector = new PageInspector(() => contentView?.webContents)
@@ -51,6 +53,7 @@ async function ensureWorkspace(): Promise<void> {
     'utf8'
   ).catch(() => {})
   await adaptations.migrate()
+  await dynamicTools.migrate()
   await seedPersona(WORKSPACE)
   await checkpoints.ensureRepo()
   logger.log('info', 'workspace', { path: WORKSPACE })
@@ -89,6 +92,8 @@ async function emitNavState(): Promise<void> {
     origin: slug ?? '',
     adapted: slug ? await adaptations.hasEnabled(slug) : false
   }
+  // Re-scope the agent's site tools to the page it's now on.
+  pageTools?.syncSiteTools(slug ?? null)
   sendToChrome(EVT.navState, state)
 }
 
@@ -346,6 +351,41 @@ function wireIpc(): void {
     reapplyIfCurrent(host)
     void emitNavState()
   })
+
+  // ---- Scaffolded tools (global + per-site) ----
+  ipcMain.handle(IPC.listTools, async () => {
+    const toSummary = (d: {
+      name: string
+      description: string
+      scope: 'global' | 'site'
+      host?: string
+      inputSchema: Record<string, unknown>
+      code: string
+    }): unknown => ({
+      name: d.name,
+      description: d.description,
+      scope: d.scope,
+      host: d.host,
+      params: d.inputSchema,
+      code: d.code
+    })
+    return {
+      global: (await dynamicTools.listGlobal()).map(toSummary),
+      sites: Object.fromEntries(
+        Object.entries(await dynamicTools.listAllSites()).map(([host, tools]) => [
+          host,
+          tools.map(toSummary)
+        ])
+      )
+    }
+  })
+  ipcMain.handle(
+    IPC.deleteTool,
+    async (_e, name: string, scope: 'global' | 'site', host?: string) => {
+      await dynamicTools.remove(name, scope, host)
+      pageTools?.refreshTools()
+    }
+  )
 
   ipcMain.handle(IPC.permissionResponse, (_e, requestId: string, optionId: string | null) => {
     pendingPermissions.get(requestId)?.(optionId)

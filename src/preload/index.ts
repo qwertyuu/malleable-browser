@@ -15,6 +15,7 @@ import {
   type HostAdaptations,
   type EditContent,
   type EditMeta,
+  type ToolLibrary,
   type SessionList
 } from '../shared/ipc.js'
 
@@ -66,6 +67,11 @@ const api = {
     ipcRenderer.invoke(IPC.setEditEnabled, host, id, enabled),
   deleteEdit: (host: string, id: string): Promise<void> =>
     ipcRenderer.invoke(IPC.deleteEdit, host, id),
+
+  // Scaffolded tools.
+  listTools: (): Promise<ToolLibrary> => ipcRenderer.invoke(IPC.listTools),
+  deleteTool: (name: string, scope: 'global' | 'site', host?: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.deleteTool, name, scope, host),
 
   // Permission prompts.
   onPermissionRequest: (cb: (r: PermissionRequestDTO) => void) =>
