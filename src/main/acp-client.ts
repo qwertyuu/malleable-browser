@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { Readable, Writable } from 'node:stream'
-import { dirname, join, resolve as resolvePath, relative, isAbsolute } from 'node:path'
+import { delimiter, dirname, join, resolve as resolvePath, relative, isAbsolute } from 'node:path'
 import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -33,10 +33,24 @@ function tokenizeCommand(cmd: string): string[] {
   return out
 }
 
-/** GUI apps launch with a bare PATH; add common locations so `gemini`/`npx` resolve. */
+/** GUI apps can inherit a sparse PATH; add common locations for agent launchers. */
 function augmentedPath(): string {
-  const extra = ['/opt/homebrew/bin', '/usr/local/bin', join(homedir(), '.local/bin')]
-  return [process.env.PATH ?? '', ...extra].filter(Boolean).join(':')
+  const current = process.env.PATH ?? process.env.Path ?? ''
+  const extra = process.platform === 'win32'
+    ? [
+        join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'npm'),
+        process.env.NVM_HOME,
+        process.env.NVM_SYMLINK,
+        process.env.ProgramFiles ? join(process.env.ProgramFiles, 'nodejs') : undefined,
+        process.env['ProgramFiles(x86)'] ? join(process.env['ProgramFiles(x86)'], 'nodejs') : undefined
+      ]
+    : ['/opt/homebrew/bin', '/usr/local/bin', join(homedir(), '.local/bin')]
+  return [current, ...extra].filter((entry): entry is string => Boolean(entry)).join(delimiter)
+}
+
+/** npm's Windows launchers are .cmd files, which require a command shell. */
+function needsWindowsCommandShell(command: string): boolean {
+  return process.platform === 'win32' && (command === 'npx' || command === 'npm')
 }
 
 /** Resolve the claude-agent-acp stdio entry point from node_modules. */
@@ -289,7 +303,9 @@ export class AcpClient {
       child = spawn(command, args, {
         cwd: this.projectRoot,
         env,
-        stdio: ['pipe', 'pipe', 'pipe']
+        stdio: ['pipe', 'pipe', 'pipe'],
+        // npx/npm are .cmd shims on Windows; other user commands stay direct.
+        shell: needsWindowsCommandShell(command)
       }) as ChildProcessWithoutNullStreams
     } catch (err) {
       this.cb.onStatus({ state: 'error', detail: `Could not launch agent: ${String((err as any)?.message ?? err)}` })
