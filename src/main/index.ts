@@ -5,6 +5,8 @@ import { promises as fsp } from 'node:fs'
 import { AcpClient } from './acp-client.js'
 import { Checkpoints } from './checkpoint.js'
 import { Adaptations } from './adaptations.js'
+import { publishHostAsExtension } from './publish-extension.js'
+import { publishHostAsUserscript } from './publish-userscript.js'
 import { SessionStore } from './sessions.js'
 import { Logger } from './logger.js'
 import { PageInspector } from './page-inspector.js'
@@ -28,6 +30,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 // agent physically cannot reach or edit the browser's own code.
 const WORKSPACE = process.env.MALLEABLE_WORKSPACE ?? join(app.getPath('userData'), 'workspace')
 const DEFAULT_URL = 'https://example.com'
+// Tampermonkey's official Chrome Web Store extension id (stable/well-known).
+const TAMPERMONKEY_ID = 'dhdgffkkebhmkfjojejmpbldmpobfkfo'
 
 let win: BrowserWindow | null = null
 let contentView: WebContentsView | null = null
@@ -225,7 +229,7 @@ function wireIpc(): void {
   })
 
   // ---- The malleability loop: adapt the CURRENT PAGE ----
-  ipcMain.handle(IPC.adaptPrompt, async (_e, text: string): Promise<AdaptResult> => {
+  ipcMain.handle(IPC.adaptPrompt, async (_e, sessionId: string, text: string): Promise<AdaptResult> => {
     if (!acp) return { ok: false, error: 'ACP not started' }
     const page = await capturePage()
     if (!page) return { ok: false, error: 'No page loaded to adapt' }
@@ -233,11 +237,11 @@ function wireIpc(): void {
     if (!slug) return { ok: false, error: 'This page has no adaptable origin' }
 
     const statusBefore = await checkpoints.status()
-    if (sessions.currentId) {
-      await sessions.setTitleIfDefault(sessions.currentId, text)
+    if (sessionId) {
+      await sessions.setTitleIfDefault(sessionId, text)
       sendToChrome(EVT.sessions, sessions.list())
     }
-    logger.log('info', 'adapt.request', { host: slug, url: page.url, request: text })
+    logger.log('info', 'adapt.request', { sessionId, host: slug, url: page.url, request: text })
     // The agent inspects the live page and manages named edits via its MCP tools
     // (save_adaptation etc.), which apply immediately. Main just checkpoints after.
     const prompt = adaptations.buildPrompt({
@@ -248,7 +252,7 @@ function wireIpc(): void {
       request: text,
       persona: await loadPersona(WORKSPACE)
     })
-    const res = await acp.prompt(prompt)
+    const res = await acp.prompt(sessionId, prompt)
 
     const treeChanged = (await checkpoints.status()) !== statusBefore
     const checkpoint = treeChanged
@@ -258,46 +262,50 @@ function wireIpc(): void {
     logger.log('info', 'adapt.result', { host: slug, ok: !res.error, treeChanged, checkpoint })
     return { ok: !res.error, stopReason: res.stopReason, error: res.error, checkpoint }
   })
-  ipcMain.handle(IPC.adaptCancel, async () => acp?.cancel())
+  ipcMain.handle(IPC.adaptCancel, async (_e, sessionId: string) => acp?.cancel(sessionId))
   ipcMain.handle(IPC.newSession, async () => (acp ? acp.newSession() : { ok: false }))
 
   // Ask the agent to manage a saved site's edits from the library (may be off-page).
-  ipcMain.handle(IPC.adaptHost, async (_e, host: string, text: string): Promise<AdaptResult> => {
-    if (!acp) return { ok: false, error: 'ACP not started' }
-    const statusBefore = await checkpoints.status()
-    if (sessions.currentId) {
-      await sessions.setTitleIfDefault(sessions.currentId, text)
-      sendToChrome(EVT.sessions, sessions.list())
+  ipcMain.handle(
+    IPC.adaptHost,
+    async (_e, sessionId: string, host: string, text: string): Promise<AdaptResult> => {
+      if (!acp) return { ok: false, error: 'ACP not started' }
+      const statusBefore = await checkpoints.status()
+      if (sessionId) {
+        await sessions.setTitleIfDefault(sessionId, text)
+        sendToChrome(EVT.sessions, sessions.list())
+      }
+      logger.log('info', 'adapt.host', { sessionId, host, request: text })
+      const onCurrent = adaptations.slugFor(contentView?.webContents.getURL() ?? '') === host
+      const prompt = adaptations.buildPrompt({
+        url: onCurrent ? (contentView?.webContents.getURL() ?? '') : `https://${host}/`,
+        title: host,
+        host,
+        edits: await adaptations.listForHost(host),
+        request: text,
+        persona: await loadPersona(WORKSPACE),
+        live: onCurrent
+      })
+      const res = await acp.prompt(sessionId, prompt)
+      const treeChanged = (await checkpoints.status()) !== statusBefore
+      const checkpoint = treeChanged
+        ? ((await checkpoints.commitArtifacts(`${host}: ${text.slice(0, 60)}`)) ?? undefined)
+        : undefined
+      void emitNavState()
+      logger.log('info', 'adapt.host.result', { host, ok: !res.error, treeChanged, checkpoint })
+      return { ok: !res.error, stopReason: res.stopReason, error: res.error, checkpoint }
     }
-    logger.log('info', 'adapt.host', { host, request: text })
-    const onCurrent = adaptations.slugFor(contentView?.webContents.getURL() ?? '') === host
-    const prompt = adaptations.buildPrompt({
-      url: onCurrent ? (contentView?.webContents.getURL() ?? '') : `https://${host}/`,
-      title: host,
-      host,
-      edits: await adaptations.listForHost(host),
-      request: text,
-      persona: await loadPersona(WORKSPACE),
-      live: onCurrent
-    })
-    const res = await acp.prompt(prompt)
-    const treeChanged = (await checkpoints.status()) !== statusBefore
-    const checkpoint = treeChanged
-      ? ((await checkpoints.commitArtifacts(`${host}: ${text.slice(0, 60)}`)) ?? undefined)
-      : undefined
-    void emitNavState()
-    logger.log('info', 'adapt.host.result', { host, ok: !res.error, treeChanged, checkpoint })
-    return { ok: !res.error, stopReason: res.stopReason, error: res.error, checkpoint }
-  })
+  )
 
   // ---- Session switching ----
+  // Threads are multiplexed: all sessions stay live at once, so switching is a
+  // pure view change in the renderer. We only reach into the agent to resume a
+  // session that isn't live yet (e.g. one persisted from a previous run) — and
+  // loadSession is a no-op if it already is, so switching mid-turn is safe.
   ipcMain.handle(IPC.listSessions, () => sessions.list())
   ipcMain.handle(IPC.switchSession, async (_e, id: string) => {
     if (!acp) return { ok: false, error: 'ACP not started' }
-    if (id === sessions.currentId) return { ok: true }
-    // Clear the transcript first; loadSession replays the old history into it.
-    sendToChrome(EVT.clearTranscript, null)
-    const res = await acp.loadSession(id)
+    const res = acp.isLive(id) ? { ok: true, alreadyLive: true } : await acp.loadSession(id)
     if (res.ok) {
       sessions.setCurrent(id)
       sendToChrome(EVT.sessions, sessions.list())
@@ -350,6 +358,49 @@ function wireIpc(): void {
     await adaptations.deleteEdit(host, id)
     reapplyIfCurrent(host)
     void emitNavState()
+  })
+  ipcMain.handle(IPC.publishHost, async (_e, host: string) => {
+    try {
+      const result = await publishHostAsExtension(adaptations, WORKSPACE, host)
+      if (result.ok && result.zipPath) shell.showItemInFolder(result.zipPath)
+      return result
+    } catch (err) {
+      logger.log('error', 'publish.extension.error', { host, err: String((err as any)?.message ?? err) })
+      throw err
+    }
+  })
+  ipcMain.handle(IPC.publishUserscript, async (_e, host: string) => {
+    try {
+      const result = await publishHostAsUserscript(adaptations, WORKSPACE, host)
+      if (result.ok && result.filePath) shell.showItemInFolder(result.filePath)
+      return result
+    } catch (err) {
+      logger.log('error', 'publish.userscript.error', { host, err: String((err as any)?.message ?? err) })
+      throw err
+    }
+  })
+  ipcMain.handle(IPC.openInTampermonkey, async (_e, host: string) => {
+    try {
+      const result = await publishHostAsUserscript(adaptations, WORKSPACE, host)
+      if (!result.ok || !result.filePath) return result
+      // Reveal the file so it's ready to drag onto Tampermonkey's dashboard tab
+      // (its own supported install method — doesn't trip Chrome's "apps,
+      // extensions, and user scripts can't be added from this website" block,
+      // since the drop target is the extension's own already-trusted UI).
+      shell.showItemInFolder(result.filePath)
+      // Best-effort: chrome-extension:// isn't a registered OS protocol, so
+      // this may not resolve on every platform/setup — it's a bonus, not the
+      // primary path, so failures are swallowed.
+      shell
+        .openExternal(`chrome-extension://${TAMPERMONKEY_ID}/options.html#nav=utils`)
+        .catch((err) => {
+          logger.log('warn', 'publish.tampermonkey.openExternal.error', { host, err: String(err) })
+        })
+      return result
+    } catch (err) {
+      logger.log('error', 'publish.tampermonkey.error', { host, err: String((err as any)?.message ?? err) })
+      throw err
+    }
   })
 
   // ---- Scaffolded tools (global + per-site) ----
@@ -423,10 +474,10 @@ function mcpServersForSession(): unknown[] {
 
 function startAcp(): void {
   acp = new AcpClient(WORKSPACE, {
-    onUpdate: (u) => sendToChrome(EVT.adaptUpdate, u),
+    onUpdate: (sessionId, u) => sendToChrome(EVT.adaptUpdate, { sessionId, update: u }),
     onStatus: (s) => sendToChrome(EVT.acpStatus, s),
     onConfig: (c) => sendToChrome(EVT.agentConfig, c),
-    onActivity: (a) => sendToChrome(EVT.activity, a),
+    onActivity: (sessionId, a) => sendToChrome(EVT.activity, { sessionId, activity: a }),
     onSession: async ({ id }) => {
       await sessions.add(id, 'New session', Date.now())
       sendToChrome(EVT.sessions, sessions.list())

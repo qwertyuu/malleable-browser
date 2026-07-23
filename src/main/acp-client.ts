@@ -167,18 +167,25 @@ class Terminal {
 }
 
 export interface AcpCallbacks {
-  onUpdate: (u: AdaptUpdate) => void
+  /** A session/update, tagged with the session it belongs to (threads are multiplexed). */
+  onUpdate: (sessionId: string, u: AdaptUpdate) => void
   onStatus: (s: AcpStatus) => void
   /** Present a permission request to the user; resolve with the chosen optionId, or null to cancel. */
   onPermission: (req: PermissionRequestDTO) => Promise<string | null>
   /** Agent config (models, permission mode) discovered / updated. */
   onConfig: (c: AgentConfig) => void
-  /** Live "what is the agent doing" signal. */
-  onActivity: (a: Activity) => void
+  /** Live "what is the agent doing" signal, per session. */
+  onActivity: (sessionId: string, a: Activity) => void
   /** A session became active (created or loaded), so main can track it. */
   onSession: (info: { id: string; reason: 'initial' | 'reset' | 'load' }) => void
   /** Structured session logging (to file + CLI). */
   log: (level: 'debug' | 'info' | 'warn' | 'error', event: string, data?: unknown) => void
+}
+
+/** Per-session turn state. Each live session tracks its own activity + token count. */
+interface LiveSession {
+  turnTokens: number
+  activityState: Activity['state']
 }
 
 /** Session updates that are logged but NOT shown as transcript rows (too noisy). */
@@ -229,11 +236,14 @@ function toConfigOptions(raw: unknown): ConfigOptionDTO[] {
 export class AcpClient {
   private conn: ClientSideConnection | null = null
   private child: ChildProcessWithoutNullStreams | null = null
-  private sessionId: string | null = null
+  /**
+   * Every live session runs concurrently on the single agent connection. The
+   * map keys ARE the set of live sessions; per-session turn state lives here so
+   * switching threads mid-turn never clobbers another thread's activity/tokens.
+   */
+  private live = new Map<string, LiveSession>()
   private terminals = new Map<string, Terminal>()
   private agentInfo: { name?: string; version?: string } = {}
-  private activityState: Activity['state'] = 'idle'
-  private turnTokens = 0
   /** User's config choices (model/mode/…), re-applied to new sessions. */
   private savedConfig: Record<string, string> = {}
   /** MCP servers (page-inspection tools) handed to every session. */
@@ -381,27 +391,27 @@ export class AcpClient {
       cwd: this.projectRoot,
       mcpServers: this.mcpServers as any
     })
-    this.sessionId = session.sessionId
-    this.turnTokens = 0
-    this.activityState = 'idle'
-    const applied = await this.reapplyConfig(session.configOptions)
+    const id = session.sessionId
+    this.live.set(id, { turnTokens: 0, activityState: 'idle' })
+    const applied = await this.reapplyConfig(id, session.configOptions)
     this.emitConfig(applied)
     this.cb.log('info', reason === 'initial' ? 'session.new' : 'session.reset', {
-      sessionId: session.sessionId,
+      sessionId: id,
       modes: (session.modes as any)?.availableModes?.map((m: any) => m.id),
       configOptions: (applied as any[] | undefined)?.map((o) => o.id)
     })
-    this.cb.onSession({ id: session.sessionId, reason })
-    return session.sessionId
+    this.cb.onSession({ id, reason })
+    this.setActivity(id, 'idle')
+    return id
   }
 
-  /** Start a brand-new coding session (clears the agent's conversation context). */
-  async newSession(): Promise<{ ok: boolean; error?: string }> {
+  /** Start a brand-new coding session (its own fresh conversation context). */
+  async newSession(): Promise<{ ok: boolean; id?: string; error?: string }> {
     if (!this.conn) return { ok: false, error: 'ACP not connected' }
     try {
-      await this.createSession('reset')
-      this.cb.onActivity({ state: 'idle' })
-      return { ok: true }
+      const id = await this.createSession('reset')
+      if (!id) return { ok: false, error: 'Could not create session' }
+      return { ok: true, id }
     } catch (err) {
       const msg = String((err as any)?.message ?? err)
       this.cb.log('error', 'session.reset.error', msg)
@@ -409,45 +419,55 @@ export class AcpClient {
     }
   }
 
+  /** Whether a session is already live in memory (no reload needed to view/prompt it). */
+  isLive(id: string): boolean {
+    return this.live.has(id)
+  }
+
   /**
-   * Resume a past session by id. The adapter replays its history as
-   * session/update notifications, so the transcript rebuilds itself.
+   * Resume a past session by id and keep it live alongside the others. The
+   * adapter replays its history as session/update notifications (tagged with
+   * this id), so the transcript rebuilds itself. A session that is already live
+   * is a no-op — we never reload it, which is what used to corrupt threads when
+   * switching mid-turn.
    */
-  async loadSession(id: string): Promise<{ ok: boolean; error?: string }> {
+  async loadSession(id: string): Promise<{ ok: boolean; error?: string; alreadyLive?: boolean }> {
     if (!this.conn) return { ok: false, error: 'ACP not connected' }
+    if (this.live.has(id)) return { ok: true, alreadyLive: true }
+    // Mark live BEFORE loading so replayed updates route to this session.
+    this.live.set(id, { turnTokens: 0, activityState: 'idle' })
     try {
-      this.turnTokens = 0
-      this.activityState = 'idle'
       const res = await this.conn.loadSession({
         sessionId: id,
         cwd: this.projectRoot,
         mcpServers: this.mcpServers as any
       })
-      this.sessionId = id
       // Only re-emit config if the load response carried options.
       const opts = (res as any)?.configOptions
-      if (Array.isArray(opts)) this.emitConfig(await this.reapplyConfig(opts))
+      if (Array.isArray(opts)) this.emitConfig(await this.reapplyConfig(id, opts))
       this.cb.onSession({ id, reason: 'load' })
-      this.cb.onActivity({ state: 'idle' })
+      // Replay drives transient activity; settle it back to idle now that it's done.
+      this.setActivity(id, 'idle')
       this.cb.log('info', 'session.load', { id })
       return { ok: true }
     } catch (err) {
+      this.live.delete(id) // load failed — it isn't live after all
       const msg = String((err as any)?.message ?? err)
       this.cb.log('error', 'session.load.error', { id, msg })
       return { ok: false, error: msg }
     }
   }
 
-  /** Re-apply remembered config choices to a freshly-created session. */
-  private async reapplyConfig(raw: unknown): Promise<unknown> {
-    if (!Array.isArray(raw) || !this.conn || !this.sessionId) return raw
+  /** Re-apply remembered config choices to a freshly-created / loaded session. */
+  private async reapplyConfig(sessionId: string, raw: unknown): Promise<unknown> {
+    if (!Array.isArray(raw) || !this.conn) return raw
     for (const opt of raw as any[]) {
       const want = this.savedConfig[opt.id]
       const exists = opt.options?.some?.((o: any) => o.value === want)
       if (want != null && want !== opt.currentValue && exists) {
         try {
           await this.conn.setSessionConfigOption({
-            sessionId: this.sessionId,
+            sessionId,
             configId: opt.id,
             value: want
           } as any)
@@ -473,57 +493,60 @@ export class AcpClient {
 
   async setConfigOption(configId: string, value: string): Promise<void> {
     this.savedConfig[configId] = value
-    if (!this.conn || !this.sessionId) return
-    try {
-      await this.conn.setSessionConfigOption({
-        sessionId: this.sessionId,
-        configId,
-        value
-      } as any)
-    } catch (err) {
-      this.cb.onUpdate({
-        kind: 'error',
-        text: `Could not set ${configId}: ${String((err as any)?.message ?? err)}`
-      })
+    if (!this.conn) return
+    // Keep every live thread consistent with the chosen model/mode.
+    for (const sessionId of this.live.keys()) {
+      try {
+        await this.conn.setSessionConfigOption({ sessionId, configId, value } as any)
+      } catch (err) {
+        this.cb.onUpdate(sessionId, {
+          kind: 'error',
+          text: `Could not set ${configId}: ${String((err as any)?.message ?? err)}`
+        })
+      }
     }
   }
 
-  async prompt(text: string): Promise<{ stopReason?: string; error?: string }> {
-    if (!this.conn || !this.sessionId) {
-      return { error: 'ACP session not ready' }
-    }
-    this.turnTokens = 0
-    this.setActivity('thinking')
+  /** Run a prompt turn on a specific session. Concurrent turns on different sessions are fine. */
+  async prompt(sessionId: string, text: string): Promise<{ stopReason?: string; error?: string }> {
+    if (!this.conn) return { error: 'ACP not connected' }
+    const st = this.live.get(sessionId)
+    if (!st) return { error: 'Session not active' }
+    st.turnTokens = 0
+    this.setActivity(sessionId, 'thinking')
     const t0 = Date.now()
-    this.cb.log('info', 'prompt.start', { chars: text.length, preview: text.slice(0, 200) })
+    this.cb.log('info', 'prompt.start', { sessionId, chars: text.length, preview: text.slice(0, 200) })
     try {
       const res = await this.conn.prompt({
-        sessionId: this.sessionId,
+        sessionId,
         prompt: [{ type: 'text', text }]
       })
       this.cb.log('info', 'prompt.done', {
+        sessionId,
         stopReason: res.stopReason,
         ms: Date.now() - t0,
-        tokens: this.turnTokens
+        tokens: st.turnTokens
       })
       return { stopReason: res.stopReason }
     } catch (err) {
       const msg = String((err as any)?.message ?? err)
-      this.cb.log('error', 'prompt.error', { msg, ms: Date.now() - t0 })
+      this.cb.log('error', 'prompt.error', { sessionId, msg, ms: Date.now() - t0 })
       return { error: msg }
     } finally {
-      this.setActivity('idle')
+      this.setActivity(sessionId, 'idle')
     }
   }
 
-  private setActivity(state: Activity['state'], detail?: string): void {
-    this.activityState = state
-    this.cb.onActivity({ state, detail, tokens: this.turnTokens || undefined })
+  private setActivity(sessionId: string, state: Activity['state'], detail?: string): void {
+    const st = this.live.get(sessionId)
+    if (!st) return
+    st.activityState = state
+    this.cb.onActivity(sessionId, { state, detail, tokens: st.turnTokens || undefined })
   }
 
-  async cancel(): Promise<void> {
-    if (this.conn && this.sessionId) {
-      await this.conn.cancel({ sessionId: this.sessionId }).catch(() => {})
+  async cancel(sessionId: string): Promise<void> {
+    if (this.conn && this.live.has(sessionId)) {
+      await this.conn.cancel({ sessionId }).catch(() => {})
     }
   }
 
@@ -533,13 +556,14 @@ export class AcpClient {
     this.child?.kill('SIGTERM')
     this.child = null
     this.conn = null
-    this.sessionId = null
+    this.live.clear()
   }
 
   private buildClient(): Client {
     const cb = this.cb
     return {
       sessionUpdate: async (params: schema.SessionNotification): Promise<void> => {
+        const sessionId = params.sessionId
         const update = params.update as any
         const type = update?.sessionUpdate
         this.logUpdate(update)
@@ -551,16 +575,19 @@ export class AcpClient {
         }
         // usage_update: fold token counts into the activity indicator, no row.
         if (type === 'usage_update') {
+          const st = this.live.get(sessionId)
           const t = sumTokens(update.usage ?? update)
-          if (t != null) this.turnTokens = t
-          this.setActivity(this.activityState)
+          if (st && t != null) {
+            st.turnTokens = t
+            this.setActivity(sessionId, st.activityState)
+          }
           return
         }
         // Other chatter is logged but kept out of the transcript.
         if (QUIET_UPDATES.has(type)) return
 
-        this.emitActivityFor(update)
-        cb.onUpdate(this.normalize(update))
+        this.emitActivityFor(sessionId, update)
+        cb.onUpdate(sessionId, this.normalize(update))
       },
 
       requestPermission: async (
@@ -569,6 +596,7 @@ export class AcpClient {
         const tc: any = params.toolCall
         const req: PermissionRequestDTO = {
           requestId: randomUUID(),
+          sessionId: (params as any).sessionId,
           title: tc?.title ?? tc?.rawInput?.description ?? 'Allow tool call?',
           toolKind: tc?.kind ?? undefined,
           locations: Array.isArray(tc?.locations)
@@ -666,17 +694,17 @@ export class AcpClient {
   }
 
   /** Drive the live activity indicator from streaming updates. */
-  private emitActivityFor(update: any): void {
+  private emitActivityFor(sessionId: string, update: any): void {
     switch (update?.sessionUpdate) {
       case 'agent_thought_chunk':
-        this.setActivity('thinking')
+        this.setActivity(sessionId, 'thinking')
         break
       case 'agent_message_chunk':
-        this.setActivity('responding')
+        this.setActivity(sessionId, 'responding')
         break
       case 'tool_call':
       case 'tool_call_update':
-        this.setActivity('tool', update.title ?? update.kind ?? 'tool')
+        this.setActivity(sessionId, 'tool', update.title ?? update.kind ?? 'tool')
         break
     }
   }

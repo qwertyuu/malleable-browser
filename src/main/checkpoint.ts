@@ -13,6 +13,9 @@ const exec = promisify(execFile)
 export class Checkpoints {
   constructor(private readonly projectRoot: string) {}
 
+  /** Serializes commit operations so concurrent turns don't race the git index. */
+  private commitQueue: Promise<unknown> = Promise.resolve()
+
   private git(args: string[]): Promise<{ stdout: string; stderr: string }> {
     return exec('git', args, { cwd: this.projectRoot, maxBuffer: 16 * 1024 * 1024 })
   }
@@ -70,6 +73,14 @@ export class Checkpoints {
    * Returns the short sha, or null if there was nothing to commit / not a repo.
    */
   async commitArtifacts(label: string): Promise<string | null> {
+    // Chain onto the queue so two concurrent turns can't interleave add/commit.
+    const run = this.commitQueue.then(() => this.commitArtifactsUnlocked(label))
+    // Keep the queue alive even if this commit throws.
+    this.commitQueue = run.catch(() => {})
+    return run
+  }
+
+  private async commitArtifactsUnlocked(label: string): Promise<string | null> {
     if (!(await this.isRepo())) return null
     try {
       await this.git(['add', '-A'])

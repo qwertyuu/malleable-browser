@@ -9,6 +9,8 @@ interface Props {
 
 const EMPTY_TOOLS: ToolLibrary = { global: [], sites: {} }
 
+type PublishKind = 'extension' | 'userscript' | 'tampermonkey'
+
 /** The library: per-site named edits + the agent's scaffolded tools (global & site). */
 export default function LibraryView({ visible, busy, onAskAgent }: Props) {
   const [hosts, setHosts] = useState<HostAdaptations[]>([])
@@ -16,6 +18,10 @@ export default function LibraryView({ visible, busy, onAskAgent }: Props) {
   const [editing, setEditing] = useState<EditContent | null>(null)
   const [dirty, setDirty] = useState(false)
   const [ask, setAsk] = useState('')
+  const [publishing, setPublishing] = useState<string | null>(null)
+  const [publishMsg, setPublishMsg] = useState<{ host: string; text: string; error?: boolean } | null>(
+    null
+  )
 
   const refresh = useCallback(async () => {
     const [h, t] = await Promise.all([window.api.listAdaptations(), window.api.listTools()])
@@ -26,6 +32,34 @@ export default function LibraryView({ visible, busy, onAskAgent }: Props) {
   useEffect(() => {
     if (visible) void refresh()
   }, [visible, refresh])
+
+  const publish = useCallback(async (host: string, kind: PublishKind) => {
+    setPublishing(`${host}:${kind}`)
+    setPublishMsg(null)
+    try {
+      const res =
+        kind === 'extension'
+          ? await window.api.publishHost(host)
+          : kind === 'userscript'
+            ? await window.api.publishUserscript(host)
+            : await window.api.openInTampermonkey(host)
+      setPublishMsg(
+        res.ok
+          ? {
+              host,
+              text:
+                kind === 'tampermonkey'
+                  ? `Saved to ${res.filePath} and opened Tampermonkey's dashboard (if installed) — drag the file onto that tab to install.`
+                  : `Published — saved to ${res.zipPath ?? res.filePath}.`
+            }
+          : { host, text: res.error ?? 'Publish failed.', error: true }
+      )
+    } catch (err) {
+      setPublishMsg({ host, text: err instanceof Error ? err.message : String(err), error: true })
+    } finally {
+      setPublishing(null)
+    }
+  }, [])
 
   const open = useCallback(async (host: string, id: string) => {
     const e = await window.api.getEdit(host, id)
@@ -167,15 +201,51 @@ export default function LibraryView({ visible, busy, onAskAgent }: Props) {
       {allHosts.map((host) => {
         const h = hostsWithEdits.get(host)
         const siteTools = tools.sites[host] ?? []
+        const publishable = h?.edits.some((e) => e.enabled && (e.hasCss || e.hasJs)) ?? false
         return (
           <div className="lib-host-group" key={host}>
-            <button
-              className="lib-host-name"
-              title={`Open ${host}`}
-              onClick={() => window.api.navigate(`https://${host}/`)}
-            >
-              {host} <span className="visit-arrow">↗</span>
-            </button>
+            <div className="lib-host-row">
+              <button
+                className="lib-host-name"
+                title={`Open ${host}`}
+                onClick={() => window.api.navigate(`https://${host}/`)}
+              >
+                {host} <span className="visit-arrow">↗</span>
+              </button>
+              {publishable && (
+                <div className="publish-actions">
+                  <button
+                    className="link-btn"
+                    disabled={publishing === `${host}:tampermonkey`}
+                    title="Save the file and open Tampermonkey's dashboard — drag the file onto it to install"
+                    onClick={() => publish(host, 'tampermonkey')}
+                  >
+                    {publishing === `${host}:tampermonkey` ? 'Opening…' : 'Open in Tampermonkey'}
+                  </button>
+                  <button
+                    className="link-btn"
+                    disabled={publishing === `${host}:userscript`}
+                    title="Save as a single .user.js file for Tampermonkey/Violentmonkey — easiest to share with others"
+                    onClick={() => publish(host, 'userscript')}
+                  >
+                    {publishing === `${host}:userscript` ? 'Publishing…' : 'Export userscript'}
+                  </button>
+                  <button
+                    className="link-btn"
+                    disabled={publishing === `${host}:extension`}
+                    title="Package this site's enabled edits into a real Chrome (MV3) extension"
+                    onClick={() => publish(host, 'extension')}
+                  >
+                    {publishing === `${host}:extension` ? 'Publishing…' : 'Publish as extension'}
+                  </button>
+                </div>
+              )}
+            </div>
+            {publishMsg?.host === host && (
+              <div className={`hint publish-msg ${publishMsg.error ? 'error' : ''}`}>
+                {publishMsg.text}
+              </div>
+            )}
             {h?.edits.map((e) => (
               <div className={`lib-row ${e.enabled ? '' : 'disabled'}`} key={e.id}>
                 <label className="switch" title={e.enabled ? 'Enabled' : 'Disabled'}>

@@ -33,6 +33,9 @@ export const IPC = {
   saveEdit: 'lib:saveEdit',
   setEditEnabled: 'lib:setEditEnabled',
   deleteEdit: 'lib:deleteEdit',
+  publishHost: 'lib:publishHost',
+  publishUserscript: 'lib:publishUserscript',
+  openInTampermonkey: 'lib:openInTampermonkey',
 
   // Agent-scaffolded tools (global + per-site).
   listTools: 'lib:listTools',
@@ -118,6 +121,35 @@ export interface Activity {
   tokens?: number
 }
 
+/**
+ * Session updates and activity are multiplexed: every session runs concurrently
+ * on the one agent connection, so each event is tagged with the session it
+ * belongs to and the renderer routes it into that session's transcript.
+ */
+export interface AdaptUpdateEvent {
+  sessionId: string
+  update: AdaptUpdate
+}
+export interface ActivityEvent {
+  sessionId: string
+  activity: Activity
+}
+
+/** Result of creating a brand-new coding session. */
+export interface NewSessionResult {
+  ok: boolean
+  id?: string
+  error?: string
+}
+
+/** Result of switching to (and, if needed, resuming) a session. */
+export interface SwitchSessionResult {
+  ok: boolean
+  error?: string
+  /** True if the session was already live in memory (no reload needed). */
+  alreadyLive?: boolean
+}
+
 export interface SelectOptionDTO {
   value: string
   name: string
@@ -178,6 +210,18 @@ export interface EditContent extends EditMeta {
   js: string
 }
 
+/** Result of packaging a host's enabled edits for export/sharing. */
+export interface PublishResult {
+  ok: boolean
+  /** Path to the generated .zip (extension export). */
+  zipPath?: string
+  /** Path to the unpacked extension folder (extension export). */
+  dir?: string
+  /** Path to the generated .user.js (userscript export). */
+  filePath?: string
+  error?: string
+}
+
 /** Suggested categories (free-form; agent may use others). */
 export const EDIT_KINDS = ['theme', 'layout', 'functionality', 'cleanup', 'other'] as const
 
@@ -209,6 +253,8 @@ export interface PermissionOptionDTO {
 
 export interface PermissionRequestDTO {
   requestId: string
+  /** The session whose turn is blocked on this request (for multiplexed threads). */
+  sessionId?: string
   title: string
   toolKind?: string
   locations?: string[]

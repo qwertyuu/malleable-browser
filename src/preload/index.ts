@@ -4,19 +4,22 @@ import {
   EVT,
   type Rect,
   type NavState,
-  type AdaptUpdate,
   type AdaptResult,
   type AcpStatus,
   type PermissionRequestDTO,
   type CheckpointInfo,
   type AgentConfig,
   type AppSettingsData,
-  type Activity,
   type HostAdaptations,
   type EditContent,
   type EditMeta,
+  type PublishResult,
   type ToolLibrary,
-  type SessionList
+  type SessionList,
+  type AdaptUpdateEvent,
+  type ActivityEvent,
+  type NewSessionResult,
+  type SwitchSessionResult
 } from '../shared/ipc.js'
 
 /** Minimal, explicit surface exposed to the trusted chrome renderer. */
@@ -29,22 +32,24 @@ const api = {
   setContentBounds: (r: Rect): Promise<void> => ipcRenderer.invoke(IPC.setContentBounds, r),
   onNavState: (cb: (s: NavState) => void) => subscribe(EVT.navState, cb),
 
-  // Malleability loop.
-  adapt: (text: string): Promise<AdaptResult> => ipcRenderer.invoke(IPC.adaptPrompt, text),
-  cancelAdapt: (): Promise<void> => ipcRenderer.invoke(IPC.adaptCancel),
-  adaptHost: (host: string, text: string): Promise<AdaptResult> =>
-    ipcRenderer.invoke(IPC.adaptHost, host, text),
-  newSession: (): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke(IPC.newSession),
-  switchSession: (id: string): Promise<{ ok: boolean; error?: string }> =>
+  // Malleability loop. Prompts target an explicit session so a mid-turn thread
+  // switch can never misroute the turn.
+  adapt: (sessionId: string, text: string): Promise<AdaptResult> =>
+    ipcRenderer.invoke(IPC.adaptPrompt, sessionId, text),
+  cancelAdapt: (sessionId: string): Promise<void> => ipcRenderer.invoke(IPC.adaptCancel, sessionId),
+  adaptHost: (sessionId: string, host: string, text: string): Promise<AdaptResult> =>
+    ipcRenderer.invoke(IPC.adaptHost, sessionId, host, text),
+  newSession: (): Promise<NewSessionResult> => ipcRenderer.invoke(IPC.newSession),
+  switchSession: (id: string): Promise<SwitchSessionResult> =>
     ipcRenderer.invoke(IPC.switchSession, id),
   listSessions: (): Promise<SessionList> => ipcRenderer.invoke(IPC.listSessions),
   onSessions: (cb: (list: SessionList) => void) => subscribe(EVT.sessions, cb),
   onClearTranscript: (cb: () => void) => subscribe(EVT.clearTranscript, cb),
-  onAdaptUpdate: (cb: (u: AdaptUpdate) => void) => subscribe(EVT.adaptUpdate, cb),
+  onAdaptUpdate: (cb: (e: AdaptUpdateEvent) => void) => subscribe(EVT.adaptUpdate, cb),
   onAcpStatus: (cb: (s: AcpStatus) => void) => subscribe(EVT.acpStatus, cb),
 
-  // Live activity + agent config (models, permission mode).
-  onActivity: (cb: (a: Activity) => void) => subscribe(EVT.activity, cb),
+  // Live activity (per session) + agent config (models, permission mode).
+  onActivity: (cb: (e: ActivityEvent) => void) => subscribe(EVT.activity, cb),
   onAgentConfig: (cb: (c: AgentConfig) => void) => subscribe(EVT.agentConfig, cb),
   setConfigOption: (configId: string, value: string): Promise<void> =>
     ipcRenderer.invoke(IPC.setConfigOption, configId, value),
@@ -67,6 +72,11 @@ const api = {
     ipcRenderer.invoke(IPC.setEditEnabled, host, id, enabled),
   deleteEdit: (host: string, id: string): Promise<void> =>
     ipcRenderer.invoke(IPC.deleteEdit, host, id),
+  publishHost: (host: string): Promise<PublishResult> => ipcRenderer.invoke(IPC.publishHost, host),
+  publishUserscript: (host: string): Promise<PublishResult> =>
+    ipcRenderer.invoke(IPC.publishUserscript, host),
+  openInTampermonkey: (host: string): Promise<PublishResult> =>
+    ipcRenderer.invoke(IPC.openInTampermonkey, host),
 
   // Scaffolded tools.
   listTools: (): Promise<ToolLibrary> => ipcRenderer.invoke(IPC.listTools),

@@ -24,6 +24,10 @@ interface Props {
   tab: Tab
   onTab: (t: Tab) => void
   sessions: SessionList
+  /** The thread currently in view (may differ briefly from sessions.currentId while switching). */
+  currentId: string | null
+  /** Session ids with a turn in flight, so the switcher can flag busy threads. */
+  busySessions: string[]
   onSwitchSession: (id: string) => void
   onAdaptHost: (host: string, text: string) => void
   onSend: (text: string) => void
@@ -50,6 +54,7 @@ const ACTIVITY_LABEL: Record<Activity['state'], string> = {
 export default function AdaptPanel(props: Props) {
   const { status, activity, config, updates, busy, permission, origin, adapted, tab, sessions } =
     props
+  const busySet = new Set(props.busySessions)
   const [text, setText] = useState('')
 
   // Elapsed-time ticker so a long turn visibly progresses instead of looking hung.
@@ -80,13 +85,14 @@ export default function AdaptPanel(props: Props) {
         <select
           className="session-select"
           data-testid="session-select"
-          value={sessions.currentId ?? ''}
+          value={props.currentId ?? ''}
           onChange={(e) => props.onSwitchSession(e.target.value)}
-          title="Switch coding session"
+          title="Switch coding session (threads run concurrently)"
         >
           {sessions.sessions.length === 0 && <option value="">session…</option>}
           {sessions.sessions.map((s) => (
             <option key={s.id} value={s.id}>
+              {busySet.has(s.id) ? '⏳ ' : ''}
               {s.title}
             </option>
           ))}

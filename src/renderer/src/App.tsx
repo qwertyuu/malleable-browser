@@ -23,17 +23,36 @@ const DEFAULT_NAV: NavState = {
   adapted: false
 }
 
+const IDLE: Activity = { state: 'idle' }
+
 export default function App() {
   const [nav, setNav] = useState<NavState>(DEFAULT_NAV)
   const [panelOpen, setPanelOpen] = useState(true)
-  const [updates, setUpdates] = useState<AdaptUpdate[]>([])
   const [status, setStatus] = useState<AcpStatus>({ state: 'starting' })
-  const [permission, setPermission] = useState<PermissionRequestDTO | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [activity, setActivity] = useState<Activity>({ state: 'idle' })
   const [config, setConfig] = useState<AgentConfig | null>(null)
   const [sessions, setSessions] = useState<SessionList>({ sessions: [], currentId: null })
   const [tab, setTab] = useState<Tab>('adapt')
+
+  // Threads run concurrently, so all per-session state is keyed by session id and
+  // the UI just renders whichever thread (`currentId`) is in view. Switching is a
+  // pure local view change — no reload, no shared mutable "current" to clobber.
+  const [currentId, setCurrentId] = useState<string | null>(null)
+  const [transcripts, setTranscripts] = useState<Record<string, AdaptUpdate[]>>({})
+  const [busyMap, setBusyMap] = useState<Record<string, boolean>>({})
+  const [activityMap, setActivityMap] = useState<Record<string, Activity>>({})
+  // Concurrent turns can each raise a permission prompt; queue them, show one at a time.
+  const [permissions, setPermissions] = useState<PermissionRequestDTO[]>([])
+
+  const updates = currentId ? (transcripts[currentId] ?? []) : []
+  const busy = currentId ? (busyMap[currentId] ?? false) : false
+  const activity = currentId ? (activityMap[currentId] ?? IDLE) : IDLE
+  const permission = permissions[0] ?? null
+  const busySessions = Object.keys(busyMap).filter((id) => busyMap[id])
+
+  /** Append one update to a specific session's transcript (coalescing streams/tools). */
+  const appendTo = useCallback((sid: string, u: AdaptUpdate) => {
+    setTranscripts((prev) => ({ ...prev, [sid]: mergeUpdate(prev[sid] ?? [], u) }))
+  }, [])
 
   const slotRef = useRef<HTMLDivElement>(null)
 
@@ -64,19 +83,41 @@ export default function App() {
     return () => cancelAnimationFrame(id)
   }, [panelOpen, reportBounds])
 
-  // Subscribe to main-process events.
+  // Subscribe to main-process events. Session-scoped events (updates, activity)
+  // are routed into their session's slice by id, so a background thread keeps
+  // filling its own transcript while you look at another.
   useEffect(() => {
     const offNav = window.api.onNavState(setNav)
     const offStatus = window.api.onAcpStatus(setStatus)
-    const offPerm = window.api.onPermissionRequest(setPermission)
-    const offUpdate = window.api.onAdaptUpdate((u) => {
-      setUpdates((prev) => mergeUpdate(prev, u))
+    const offPerm = window.api.onPermissionRequest((r) => {
+      setPermissions((prev) => [...prev, r])
+      // Bring the blocked thread into view so the prompt has context.
+      if (r.sessionId) setCurrentId(r.sessionId)
     })
-    const offActivity = window.api.onActivity(setActivity)
+    const offUpdate = window.api.onAdaptUpdate(({ sessionId, update }) => {
+      setTranscripts((prev) => ({ ...prev, [sessionId]: mergeUpdate(prev[sessionId] ?? [], update) }))
+    })
+    const offActivity = window.api.onActivity(({ sessionId, activity }) => {
+      setActivityMap((prev) => ({ ...prev, [sessionId]: activity }))
+    })
     const offConfig = window.api.onAgentConfig(setConfig)
-    const offSessions = window.api.onSessions(setSessions)
-    const offClear = window.api.onClearTranscript(() => setUpdates([]))
-    void window.api.listSessions().then(setSessions)
+    const offSessions = window.api.onSessions((list) => {
+      setSessions(list)
+      // Keep the current view if that session still exists; otherwise (e.g. after
+      // an agent restart) adopt whatever session the main process now considers current.
+      setCurrentId((cur) => (cur && list.sessions.some((s) => s.id === cur) ? cur : list.currentId))
+    })
+    const offClear = window.api.onClearTranscript(() => {
+      // Agent restarted — every session died; drop all thread state.
+      setTranscripts({})
+      setBusyMap({})
+      setActivityMap({})
+      setPermissions([])
+    })
+    void window.api.listSessions().then((list) => {
+      setSessions(list)
+      setCurrentId(list.currentId)
+    })
     return () => {
       offNav()
       offStatus()
@@ -89,51 +130,61 @@ export default function App() {
     }
   }, [])
 
-  const sendAdapt = useCallback(async (text: string) => {
-    setUpdates((prev) => [...prev, { kind: 'user', text }])
-    setBusy(true)
-    const res = await window.api.adapt(text)
-    setBusy(false)
-    if (res.error) {
-      setUpdates((prev) => [...prev, { kind: 'error', text: res.error }])
-    } else {
-      setUpdates((prev) => [
-        ...prev,
-        {
-          kind: 'info',
-          text: `Done (${res.stopReason ?? 'ok'})${res.checkpoint ? ` · checkpoint ${res.checkpoint}` : ''}`
-        }
-      ])
-    }
-  }, [])
+  const sendAdapt = useCallback(
+    async (text: string) => {
+      const sid = currentId
+      if (!sid) return
+      appendTo(sid, { kind: 'user', text })
+      setBusyMap((prev) => ({ ...prev, [sid]: true }))
+      const res = await window.api.adapt(sid, text)
+      setBusyMap((prev) => ({ ...prev, [sid]: false }))
+      appendTo(
+        sid,
+        res.error
+          ? { kind: 'error', text: res.error }
+          : {
+              kind: 'info',
+              text: `Done (${res.stopReason ?? 'ok'})${res.checkpoint ? ` · checkpoint ${res.checkpoint}` : ''}`
+            }
+      )
+    },
+    [currentId, appendTo]
+  )
 
   const newSession = useCallback(async () => {
     const res = await window.api.newSession()
-    setUpdates(res.ok ? [] : [{ kind: 'error', text: `New session failed: ${res.error ?? ''}` }])
-    setBusy(false)
-  }, [])
+    if (res.ok && res.id) setCurrentId(res.id)
+    else if (currentId) appendTo(currentId, { kind: 'error', text: `New session failed: ${res.error ?? ''}` })
+  }, [currentId, appendTo])
 
-  const switchSession = useCallback(async (id: string) => {
-    setUpdates([])
-    setBusy(false)
-    const res = await window.api.switchSession(id)
-    if (!res.ok) setUpdates([{ kind: 'error', text: `Could not load session: ${res.error ?? ''}` }])
-  }, [])
+  const switchSession = useCallback(
+    async (id: string) => {
+      setCurrentId(id) // instant view change; the session is (or becomes) live in main
+      const res = await window.api.switchSession(id)
+      if (!res.ok) appendTo(id, { kind: 'error', text: `Could not load session: ${res.error ?? ''}` })
+    },
+    [appendTo]
+  )
 
   // Ask the agent to edit a saved site's overlay (from the Library).
-  const adaptHost = useCallback(async (host: string, text: string) => {
-    setTab('adapt')
-    setUpdates((prev) => [...prev, { kind: 'user', text: `[${host}] ${text}` }])
-    setBusy(true)
-    const res = await window.api.adaptHost(host, text)
-    setBusy(false)
-    setUpdates((prev) => [
-      ...prev,
-      res.error
-        ? { kind: 'error', text: res.error }
-        : { kind: 'info', text: `Done (${res.stopReason ?? 'ok'})` }
-    ])
-  }, [])
+  const adaptHost = useCallback(
+    async (host: string, text: string) => {
+      const sid = currentId
+      if (!sid) return
+      setTab('adapt')
+      appendTo(sid, { kind: 'user', text: `[${host}] ${text}` })
+      setBusyMap((prev) => ({ ...prev, [sid]: true }))
+      const res = await window.api.adaptHost(sid, host, text)
+      setBusyMap((prev) => ({ ...prev, [sid]: false }))
+      appendTo(
+        sid,
+        res.error
+          ? { kind: 'error', text: res.error }
+          : { kind: 'info', text: `Done (${res.stopReason ?? 'ok'})` }
+      )
+    },
+    [currentId, appendTo]
+  )
 
   // Cmd/Ctrl+Shift+N starts a fresh coding session.
   useEffect(() => {
@@ -147,13 +198,13 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [newSession])
 
-  const answerPermission = useCallback(
-    (optionId: string | null) => {
-      if (permission) window.api.respondPermission(permission.requestId, optionId)
-      setPermission(null)
-    },
-    [permission]
-  )
+  const answerPermission = useCallback((optionId: string | null) => {
+    setPermissions((prev) => {
+      const [head, ...rest] = prev
+      if (head) window.api.respondPermission(head.requestId, optionId)
+      return rest
+    })
+  }, [])
 
   return (
     <div className="app">
@@ -181,10 +232,12 @@ export default function App() {
             tab={tab}
             onTab={setTab}
             sessions={sessions}
+            currentId={currentId}
+            busySessions={busySessions}
             onSwitchSession={switchSession}
             onAdaptHost={adaptHost}
             onSend={sendAdapt}
-            onCancel={() => window.api.cancelAdapt()}
+            onCancel={() => currentId && window.api.cancelAdapt(currentId)}
             onNewSession={newSession}
             onAnswerPermission={answerPermission}
             onSetConfigOption={(configId, value) => {
@@ -203,20 +256,19 @@ export default function App() {
             }}
             onResetSite={async () => {
               await window.api.resetSite()
-              setUpdates((prev) => [
-                ...prev,
-                { kind: 'info', text: `Reset adaptations for ${nav.origin || 'this site'}` }
-              ])
+              if (currentId)
+                appendTo(currentId, {
+                  kind: 'info',
+                  text: `Reset adaptations for ${nav.origin || 'this site'}`
+                })
             }}
             onRevert={async () => {
               const info = await window.api.revertLast()
-              setUpdates((prev) => [
-                ...prev,
-                {
+              if (currentId)
+                appendTo(currentId, {
                   kind: 'info',
                   text: info ? `Reverted to ${info.sha} — ${info.subject}` : 'Nothing to revert'
-                }
-              ])
+                })
             }}
           />
         )}
