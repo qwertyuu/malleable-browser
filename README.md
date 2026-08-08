@@ -88,6 +88,7 @@ src/
     adaptations.ts          #   per-site edit library (CRUD + injector + prompt)
     page-inspector.ts       #   DOM/JS/console/network/screenshot backing tools
     page-tools-server.ts    #   in-process MCP server exposing the agent's tools
+    cdp-bridge.ts           #   scoped raw CDP-over-WebSocket relay for the page
     dynamic-tools.ts        #   registry for agent-scaffolded tools (tools/*.json)
     sessions.ts             #   session list persistence
     checkpoint.ts           #   git checkpoint / revert in the workspace
@@ -114,8 +115,11 @@ All user artifacts live **outside the app**, in a git-backed workspace:
   (macOS: `~/Library/Application Support/malleable-browser/workspace`).
 - Override with the `MALLEABLE_WORKSPACE` env var.
 - Contents: `adaptations/` (the edit library), `tools/` (agent-scaffolded tools),
-  `.malleable/sessions.json`, `logs/`, `persona.md`, and a `.git` repo used for
-  checkpoints. It is created and `git init`'d on first launch.
+  `live/<host>/{network,console}.jsonl` (mirrored, grep/tail-able page history —
+  gitignored, since captured headers/bodies can carry auth tokens/cookies),
+  `.malleable/sessions.json`, `.malleable/cdp.json` (the raw CDP endpoint, see
+  below), `logs/`, `persona.md`, and a `.git` repo used for checkpoints. It is
+  created and `git init`'d on first launch.
 
 The workspace is also the agent's ACP `cwd`, so edits/tools it writes land here.
 
@@ -177,6 +181,24 @@ Exposed by an in-process, **localhost-only, bearer-token-gated** MCP server
 Scaffolded tools run as page-JS with an `args` object; the server is stateful so
 it can push `tools/list_changed` and the agent can use a new tool the same turn.
 
+### Beyond the tool menu: a raw CDP escape hatch
+
+The tools above are a curated vocabulary — good for the common cases, but any
+fixed menu can only do what it was written to do. For anything else, the agent
+has the same kind of generic reach into the page any other automation would:
+
+- **`.malleable/cdp.json`** — a scoped, single-target Chrome DevTools Protocol
+  WebSocket for the live page (`cdp-bridge.ts`). Connect with any CDP-speaking
+  approach (a few lines of `ws` + JSON-RPC, `chrome-remote-interface` in
+  target-scoped mode) instead of being limited to `dom_query`/`run_js`. Only an
+  allow-listed set of domains is forwarded — `DOM`, `Runtime`, `Page`, `Input`,
+  `CSS`, `Log`, `Performance`, and read-only `Network` — see Safety model below.
+- **`live/<host>/{network,console}.jsonl`** — the same history `get_network`/
+  `get_console` expose, mirrored to plain append-only files so it's `grep`/
+  `tail`-able like any other file instead of only reachable through a tool call.
+
+Both are discoverable as ordinary facts about the workspace, not a special API.
+
 ---
 
 ## Safety model
@@ -192,6 +214,15 @@ it can push `tools/list_changed` and the agent can use a new tool the same turn.
   gate.
 - Injected overlay JS is wrapped in a guarded IIFE so a bad edit can't break a
   page.
+- The raw CDP bridge (`cdp-bridge.ts`) is a **single-target relay**: it forwards
+  only to the one content `WebContentsView`, never a browser-wide debugging
+  port, so it can't be used to pivot to the app's own chrome/renderer. It also
+  **allow-lists domains**: `Target`/`Browser` (other targets), `Storage`
+  (cookie/site-data dumping), `Fetch` (traffic interception/mocking), and
+  `Emulation`/`Security` (device/geo/cert spoofing) are all rejected — real
+  capability classes beyond "drive this one page," deliberately not granted by
+  default. The page's own sandbox is unaffected either way: this only widens
+  what the *agent* can do from the host side, same direction as `run_js` today.
 - Every changing turn is **git-checkpointed** in the workspace; **↺ Revert** does
   `git reset --hard HEAD~1`, **Reset site** deletes a host's edits.
 

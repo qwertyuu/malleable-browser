@@ -59,7 +59,9 @@ default `app.getPath('userData')/workspace`, override with `MALLEABLE_WORKSPACE`
 This is also the agent's ACP `cwd`, which is the core safety boundary: the agent
 literally cannot read or edit the browser's own code. Layout: `adaptations/<host>/<editId>/`
 (meta.json + overlay.css/js), `tools/*.json` (agent-scaffolded tools),
-`.malleable/sessions.json`, `logs/`, `persona.md`, `.git`.
+`live/<host>/{network,console}.jsonl` (mirrored page history, gitignored),
+`.malleable/sessions.json`, `.malleable/cdp.json` (raw CDP endpoint), `logs/`,
+`persona.md`, `.git`.
 
 Note: `settings.json` (which ACP agent to run) lives in `userData` directly, NOT
 in the workspace — see `app-settings.ts`.
@@ -75,7 +77,15 @@ in the workspace — see `app-settings.ts`.
   gated) handed to each session. Exposes the agent's live page tools (`dom_query`,
   `run_js`, `screenshot`, `save_adaptation`, `define_tool`, …). Stateful so it can
   push `tools/list_changed` and let the agent use a just-scaffolded tool same-turn.
-- **page-inspector.ts** — backs those tools against the live `WebContentsView`.
+- **page-inspector.ts** — backs those tools against the live `WebContentsView`;
+  also mirrors captured network/console entries to
+  `live/<host>/{network,console}.jsonl` as they're captured.
+- **cdp-bridge.ts** — scoped, single-target CDP-over-WebSocket relay for the
+  live page, reusing the debugger session `page-inspector.ts` already attaches.
+  Domain-allow-listed (no `Target`/`Browser`/`Storage`/`Emulation`/`Security`/
+  `Fetch`) so it can't pivot to other targets or grant capability classes beyond
+  "drive this one page." Endpoint published as `.malleable/cdp.json`, not a tool
+  call — the general escape hatch for automation the MCP tool menu doesn't cover.
 - **adaptations.ts** — per-site edit library CRUD + the injector (applies enabled
   edits on page load via `insertCSS` + guarded `executeJavaScript`) + prompt
   construction.

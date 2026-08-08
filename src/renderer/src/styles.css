@@ -136,6 +136,24 @@ body {
   color: #fff;
 }
 
+.safe-btn {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 10px;
+  border: 1px solid var(--chrome-border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.safe-btn.active {
+  background: var(--ok);
+  border-color: var(--ok);
+  color: #0d1f18;
+}
+
 /* ---- Body: content slot + panel ---- */
 .body {
   flex: 1;

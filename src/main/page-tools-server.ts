@@ -158,8 +158,22 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
   )
   server.registerTool(
     'get_network',
-    { description: 'Recent page network requests.', inputSchema: { limit: z.number().optional() } },
-    async ({ limit }) => jsonResult(inspector.getNetwork(limit ?? 50))
+    {
+      description:
+        'Recent page network requests, with full headers/bodies/timing (persists across reloads). ' +
+        'Filter to cut through noisy hosts: urlContains matches the URL substring (case-insensitive), ' +
+        'type matches the resource type (e.g. XHR, Fetch, Document, Script, Image), method matches the ' +
+        'HTTP verb, status matches the exact response status code.',
+      inputSchema: {
+        limit: z.number().optional(),
+        urlContains: z.string().optional(),
+        type: z.string().optional(),
+        method: z.string().optional(),
+        status: z.number().optional()
+      }
+    },
+    async ({ limit, urlContains, type, method, status }) =>
+      jsonResult(inspector.getNetwork(limit ?? 50, { urlContains, type, method, status }))
   )
   server.registerTool(
     'screenshot',

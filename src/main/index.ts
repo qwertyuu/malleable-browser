@@ -11,6 +11,7 @@ import { SessionStore } from './sessions.js'
 import { Logger } from './logger.js'
 import { PageInspector } from './page-inspector.js'
 import { startPageToolsServer, type PageToolsHandle } from './page-tools-server.js'
+import { startCdpBridge, type CdpBridgeHandle } from './cdp-bridge.js'
 import { DynamicTools } from './dynamic-tools.js'
 import { loadPersona, seedPersona } from './persona.js'
 import { AppSettings } from './app-settings.js'
@@ -36,21 +37,34 @@ const TAMPERMONKEY_ID = 'dhdgffkkebhmkfjojejmpbldmpobfkfo'
 let win: BrowserWindow | null = null
 let contentView: WebContentsView | null = null
 let acp: AcpClient | null = null
+// Safe Mode: strip the browser's automation fingerprint (CDP debugger attached,
+// Electron-flavored user agent, injected adaptations) for sites — banks, mostly —
+// whose bot/fraud detection blocks anything that doesn't look like stock Chrome.
+let safeMode = false
+let defaultUserAgent = ''
+let safeUserAgent = ''
 const checkpoints = new Checkpoints(WORKSPACE)
 const adaptations = new Adaptations(WORKSPACE)
 const dynamicTools = new DynamicTools(WORKSPACE)
 const sessions = new SessionStore(WORKSPACE)
 const logger = new Logger(join(WORKSPACE, 'logs'))
-const pageInspector = new PageInspector(() => contentView?.webContents)
+const pageInspector = new PageInspector(
+  () => contentView?.webContents,
+  () => adaptations.slugFor(contentView?.webContents.getURL() ?? ''),
+  WORKSPACE
+)
 const appSettings = new AppSettings(join(app.getPath('userData'), 'settings.json'))
 let pageTools: PageToolsHandle | null = null
+let cdpBridge: CdpBridgeHandle | null = null
 
 /** Create the workspace and make it a git repo so checkpoints/revert work. */
 async function ensureWorkspace(): Promise<void> {
   await fsp.mkdir(WORKSPACE, { recursive: true })
   await fsp.mkdir(join(WORKSPACE, 'adaptations'), { recursive: true })
   await fsp.mkdir(join(WORKSPACE, 'tools'), { recursive: true })
-  await fsp.writeFile(join(WORKSPACE, '.gitignore'), 'logs/\n.malleable/\n', 'utf8').catch(() => {})
+  // live/ holds raw captured network+console history (headers/bodies can carry
+  // auth tokens/cookies) — kept out of checkpoints, same treatment as logs/.
+  await fsp.writeFile(join(WORKSPACE, '.gitignore'), 'logs/\n.malleable/\nlive/\n', 'utf8').catch(() => {})
   await fsp.writeFile(
     join(WORKSPACE, 'README.md'),
     '# Malleable Browser workspace\n\nAgent-authored site overlays (`adaptations/`) and tools (`tools/`). Managed by the app.\n',
@@ -125,6 +139,15 @@ function reapplyIfCurrent(host: string): void {
   if (wc && adaptations.slugFor(wc.getURL()) === host) wc.reload()
 }
 
+/**
+ * Strip this app's "<name>/<version>" and "Electron/<version>" tokens out of the
+ * default UA, leaving the stock Chromium identity (same real engine, just no
+ * automation-tool giveaway) that Safe Mode presents to the page.
+ */
+function deriveSafeUserAgent(ua: string): string {
+  return ua.replace(/\s*\S+\/[\d.]+(?=\s+Chrome\/)/, '').replace(/\s*Electron\/[\d.]+/, '')
+}
+
 /** Lightweight page identity. The agent pulls DOM/console/etc. via its tools. */
 async function capturePage(): Promise<{ url: string; title: string } | null> {
   const wc = contentView?.webContents
@@ -153,6 +176,9 @@ function createContentView(): void {
   contentView.setBounds({ x: 0, y: 0, width: 0, height: 0 })
 
   const wc = contentView.webContents
+  defaultUserAgent = wc.userAgent
+  safeUserAgent = deriveSafeUserAgent(defaultUserAgent)
+
   wc.on('did-navigate', () => void emitNavState())
   wc.on('did-navigate-in-page', () => void emitNavState())
   wc.on('did-start-loading', () => void emitNavState())
@@ -160,8 +186,11 @@ function createContentView(): void {
   wc.on('page-title-updated', () => void emitNavState())
 
   // Inject this origin's saved content adaptation into every page load. Early
-  // (dom-ready) so styles apply before paint; JS is guarded inside apply().
-  wc.on('dom-ready', () => void adaptations.apply(wc, wc.getURL()))
+  // (dom-ready) so styles apply before paint; JS is guarded inside apply(). Skipped
+  // in Safe Mode, which aims to look exactly like stock Chrome.
+  wc.on('dom-ready', () => {
+    if (!safeMode) void adaptations.apply(wc, wc.getURL())
+  })
 
   // Wire console + network capture for the agent's page-inspection tools.
   pageInspector.attach(wc)
@@ -228,6 +257,39 @@ function wireIpc(): void {
     })
   })
 
+  // Safe Mode: drop the automation fingerprint for the current page (CDP debugger,
+  // Electron UA, adaptations) and reload so the site sees a stock-Chrome identity.
+  // Turning it off doesn't force the debugger back on — that only happens lazily
+  // when the agent is actually asked to work on a page (see adaptPrompt/adaptHost).
+  ipcMain.handle(IPC.setSafeMode, (_e, enabled: boolean) => {
+    safeMode = enabled
+    const wc = contentView?.webContents
+    if (wc) {
+      if (enabled) pageInspector.setCaptureEnabled(wc, false)
+      wc.setUserAgent(enabled ? safeUserAgent : defaultUserAgent)
+      wc.reload()
+    }
+    logger.log('info', 'safeMode.set', { enabled })
+    return { ok: true, enabled }
+  })
+
+  // Clear cookies + localStorage/indexedDB/cache for the current page's origin and
+  // reload. Ordinary "clear site data" hygiene — useful when a site's own state
+  // (e.g. a bot-detection risk cookie) got stuck in a bad state and needs a clean
+  // slate, the same way clearing cookies in any browser would.
+  ipcMain.handle(IPC.clearSiteData, async () => {
+    const wc = contentView?.webContents
+    const url = wc?.getURL()
+    if (!wc || !url) return { ok: false }
+    const ses = wc.session
+    const cookies = await ses.cookies.get({ url })
+    await Promise.all(cookies.map((c) => ses.cookies.remove(url, c.name).catch(() => {})))
+    await ses.clearStorageData({ origin: new URL(url).origin }).catch(() => {})
+    wc.reload()
+    logger.log('info', 'clearSiteData', { url })
+    return { ok: true }
+  })
+
   // ---- The malleability loop: adapt the CURRENT PAGE ----
   ipcMain.handle(IPC.adaptPrompt, async (_e, sessionId: string, text: string): Promise<AdaptResult> => {
     if (!acp) return { ok: false, error: 'ACP not started' }
@@ -235,6 +297,10 @@ function wireIpc(): void {
     if (!page) return { ok: false, error: 'No page loaded to adapt' }
     const slug = adaptations.slugFor(page.url)
     if (!slug) return { ok: false, error: 'This page has no adaptable origin' }
+
+    // Turn on CDP network/console capture now that the agent is actually about to
+    // work on this page (Safe Mode overrides this and keeps it off regardless).
+    if (!safeMode) pageInspector.setCaptureEnabled(contentView?.webContents, true)
 
     const statusBefore = await checkpoints.status()
     if (sessionId) {
@@ -270,6 +336,9 @@ function wireIpc(): void {
     IPC.adaptHost,
     async (_e, sessionId: string, host: string, text: string): Promise<AdaptResult> => {
       if (!acp) return { ok: false, error: 'ACP not started' }
+      // Same lazy capture-on as adaptPrompt — only instrument the page once the
+      // agent is actually asked to work on it.
+      if (!safeMode) pageInspector.setCaptureEnabled(contentView?.webContents, true)
       const statusBefore = await checkpoints.status()
       if (sessionId) {
         await sessions.setTitleIfDefault(sessionId, text)
@@ -520,6 +589,32 @@ app.whenReady().then(async () => {
   } catch (err) {
     logger.log('error', 'mcp.server.failed', String((err as any)?.message ?? err))
   }
+  // Raw CDP escape hatch for automation beyond the built-in MCP tools — see
+  // cdp-bridge.ts. Published as a plain workspace fact, not a tool call.
+  try {
+    cdpBridge = await startCdpBridge(() => contentView?.webContents)
+    await fsp.mkdir(join(WORKSPACE, '.malleable'), { recursive: true })
+    await fsp.writeFile(
+      join(WORKSPACE, '.malleable', 'cdp.json'),
+      JSON.stringify(
+        {
+          wsUrl: cdpBridge.url,
+          allowedDomains: cdpBridge.allowedDomains,
+          note:
+            'Raw CDP session for the live page only (single target — Target/Browser domains are rejected, ' +
+            'as are Storage/Emulation/Security/Fetch). Connect with any CDP-speaking approach (a small ws + ' +
+            'JSON-RPC script, chrome-remote-interface in target-scoped mode) for automation the built-in MCP ' +
+            'tools (dom_query, run_js, ...) do not cover. See live/<host>/{network,console}.jsonl for ' +
+            'grep/tail-able page history.'
+        },
+        null,
+        2
+      ),
+      'utf8'
+    )
+  } catch (err) {
+    logger.log('error', 'cdp.bridge.failed', String((err as any)?.message ?? err))
+  }
   startAcp()
 
   app.on('activate', () => {
@@ -535,6 +630,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   acp?.stop()
   pageTools?.close()
+  cdpBridge?.close()
   logger.close()
 })
 

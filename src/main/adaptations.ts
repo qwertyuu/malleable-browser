@@ -236,7 +236,7 @@ export class Adaptations {
       '',
       args.live === false
         ? `NOTE: "${args.host}" is NOT the page currently on screen. Pass host:"${args.host}" to the adaptation tools. Live page tools reflect the current page, which may differ — prefer editing existing edits by id.`
-        : 'Inspect the LIVE page first with dom_query / run_js / screenshot / get_console / get_network (no HTML is included here). Verify selectors against the real DOM and screenshot after saving to confirm. CSS for looks; JS only for behavior; keep overlay JS idempotent.',
+        : 'Inspect the LIVE page first with dom_query / run_js / screenshot / get_console / get_network (no HTML is included here). Verify selectors against the real DOM and screenshot after saving to confirm. CSS for looks; JS only for behavior; keep overlay JS idempotent. If these don\'t fit — e.g. real automation, or reading page history without re-deriving it — you also have .malleable/cdp.json (a raw CDP endpoint for this page; connect with any CDP-speaking approach) and live/<host>/{network,console}.jsonl (grep/tail-able history), the same reach any other automation on this machine would have.',
       '',
       `Current page: ${args.title} — ${args.url}`,
       `Host: ${args.host}`,

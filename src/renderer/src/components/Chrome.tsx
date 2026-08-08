@@ -4,7 +4,9 @@ import type { NavState } from '../../../shared/ipc'
 interface Props {
   nav: NavState
   panelOpen: boolean
+  safeMode: boolean
   onTogglePanel: () => void
+  onToggleSafeMode: () => void
   onNavigate: (url: string) => void
   onBack: () => void
   onForward: () => void
@@ -68,6 +70,19 @@ export default function Chrome(props: Props) {
           spellCheck={false}
         />
       </form>
+
+      <button
+        className={`safe-btn ${props.safeMode ? 'active' : ''}`}
+        data-testid="toggle-safe-mode"
+        onClick={props.onToggleSafeMode}
+        title={
+          props.safeMode
+            ? 'Safe mode is on: no CDP debugger, stock Chrome user agent, no adaptations injected. Click to turn off.'
+            : 'Safe mode: browse this page like stock Chrome (no CDP debugger, real Chrome user agent, no adaptations). Use it for sites — banks, mostly — that block automated browsers.'
+        }
+      >
+        🛡 {props.safeMode ? 'Safe' : 'Safe mode'}
+      </button>
 
       <button
         className={`adapt-btn ${panelOpen ? 'active' : ''}`}

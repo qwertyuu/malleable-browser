@@ -36,6 +36,7 @@ interface Props {
   onAnswerPermission: (optionId: string | null) => void
   onResetSite: () => void
   onRevert: () => void
+  onClearSiteData: () => void
   onSetConfigOption: (configId: string, value: string) => void
 }
 
@@ -165,6 +166,14 @@ export default function AdaptPanel(props: Props) {
             </button>
             <button className="reset-site-btn" onClick={props.onRevert} title="Undo last change (git)">
               ↺ Revert
+            </button>
+            <button
+              className="reset-site-btn"
+              onClick={props.onClearSiteData}
+              disabled={!origin}
+              title="Clear cookies, localStorage, and cached data for this site, then reload"
+            >
+              Clear site data
             </button>
           </div>
 

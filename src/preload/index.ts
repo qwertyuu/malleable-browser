@@ -31,6 +31,9 @@ const api = {
   reload: (): Promise<void> => ipcRenderer.invoke(IPC.reload),
   setContentBounds: (r: Rect): Promise<void> => ipcRenderer.invoke(IPC.setContentBounds, r),
   onNavState: (cb: (s: NavState) => void) => subscribe(EVT.navState, cb),
+  setSafeMode: (enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> =>
+    ipcRenderer.invoke(IPC.setSafeMode, enabled),
+  clearSiteData: (): Promise<{ ok: boolean }> => ipcRenderer.invoke(IPC.clearSiteData),
 
   // Malleability loop. Prompts target an explicit session so a mid-turn thread
   // switch can never misroute the turn.

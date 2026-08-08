@@ -28,6 +28,7 @@ const IDLE: Activity = { state: 'idle' }
 export default function App() {
   const [nav, setNav] = useState<NavState>(DEFAULT_NAV)
   const [panelOpen, setPanelOpen] = useState(true)
+  const [safeMode, setSafeMode] = useState(false)
   const [status, setStatus] = useState<AcpStatus>({ state: 'starting' })
   const [config, setConfig] = useState<AgentConfig | null>(null)
   const [sessions, setSessions] = useState<SessionList>({ sessions: [], currentId: null })
@@ -198,6 +199,14 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [newSession])
 
+  const toggleSafeMode = useCallback(() => {
+    setSafeMode((prev) => {
+      const next = !prev
+      void window.api.setSafeMode(next)
+      return next
+    })
+  }, [])
+
   const answerPermission = useCallback((optionId: string | null) => {
     setPermissions((prev) => {
       const [head, ...rest] = prev
@@ -211,7 +220,9 @@ export default function App() {
       <Chrome
         nav={nav}
         panelOpen={panelOpen}
+        safeMode={safeMode}
         onTogglePanel={() => setPanelOpen((v) => !v)}
+        onToggleSafeMode={toggleSafeMode}
         onNavigate={(url) => window.api.navigate(url)}
         onBack={() => window.api.goBack()}
         onForward={() => window.api.goForward()}
@@ -268,6 +279,14 @@ export default function App() {
                 appendTo(currentId, {
                   kind: 'info',
                   text: info ? `Reverted to ${info.sha} — ${info.subject}` : 'Nothing to revert'
+                })
+            }}
+            onClearSiteData={async () => {
+              await window.api.clearSiteData()
+              if (currentId)
+                appendTo(currentId, {
+                  kind: 'info',
+                  text: `Cleared cookies and site data for ${nav.origin || 'this site'}`
                 })
             }}
           />

@@ -9,6 +9,8 @@ export const IPC = {
   goForward: 'browser:goForward',
   reload: 'browser:reload',
   setContentBounds: 'browser:setContentBounds',
+  setSafeMode: 'browser:setSafeMode',
+  clearSiteData: 'browser:clearSiteData',
 
   // The malleability loop.
   adaptPrompt: 'acp:prompt',
