@@ -38,6 +38,118 @@ body {
   height: 100%;
 }
 
+/* ---- Tab strip ---- */
+.tab-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 6px 8px 0;
+  background: var(--chrome);
+  flex: 0 0 auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-app-region: drag;
+}
+.tab-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  -webkit-app-region: no-drag;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  /* Shrink to share the row, but never collapse past a readable stub. */
+  flex: 0 1 190px;
+  min-width: 82px;
+  max-width: 190px;
+  padding: 5px 6px 5px 10px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: default;
+  user-select: none;
+}
+
+.tab:hover {
+  background: #ffffff0d;
+}
+
+.tab.active {
+  background: var(--bg);
+  border-color: var(--chrome-border);
+  color: var(--text);
+}
+
+.tab-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--accent);
+  opacity: 0.9;
+}
+
+.tab-spinner {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--accent-dim);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: tab-spin 0.7s linear infinite;
+}
+
+@keyframes tab-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.tab-close,
+.tab-new {
+  -webkit-app-region: no-drag;
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.tab-close {
+  padding: 2px 4px;
+  font-size: 14px;
+  /* Only offer the target once the tab is under the pointer or in focus. */
+  opacity: 0;
+}
+
+.tab:hover .tab-close,
+.tab.active .tab-close {
+  opacity: 1;
+}
+
+.tab-close:hover,
+.tab-new:hover {
+  background: #ffffff1a;
+  color: var(--text);
+}
+
+.tab-new {
+  align-self: center;
+  padding: 3px 9px;
+  font-size: 15px;
+}
+
 /* ---- Toolbar / chrome ---- */
 .toolbar {
   display: flex;
@@ -48,6 +160,11 @@ body {
   border-bottom: 1px solid var(--chrome-border);
   flex: 0 0 auto;
   -webkit-app-region: drag;
+}
+
+/* The strip's active tab already reads as the top edge of the content area. */
+.tab-strip + .toolbar {
+  border-top: 1px solid var(--chrome-border);
 }
 
 .toolbar button,
@@ -1195,3 +1312,103 @@ details.row.plan {
   font-size: 12px;
 }
 .lib-tool-plist code { color: var(--text); }
+
+/* ---- Bubble consent (the one gate in the bubble model) ---- */
+.consent-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0b0b12cc;
+}
+
+.consent {
+  width: 420px;
+  max-width: calc(100vw - 40px);
+  background: var(--chrome);
+  border: 1px solid var(--chrome-border);
+  border-radius: 10px;
+  padding: 18px 20px 16px;
+  box-shadow: 0 18px 50px #00000073;
+}
+
+.consent-title {
+  font-size: 15px;
+  margin-bottom: 12px;
+}
+
+.consent-hosts {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: var(--field);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.consent-hosts li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.consent-hosts .already {
+  color: var(--muted);
+}
+
+.consent-hosts .tag {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-left: auto;
+}
+
+.consent-hosts .tag.new {
+  color: var(--accent);
+}
+
+.consent-body {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.consent-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.consent-actions button {
+  font: inherit;
+  padding: 7px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.consent-deny {
+  background: transparent;
+  border: 1px solid var(--chrome-border);
+  color: var(--text);
+}
+
+.consent-deny:hover {
+  background: #ffffff0f;
+}
+
+.consent-allow {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: #fff;
+}
+
+.consent-allow:hover {
+  filter: brightness(1.1);
+}

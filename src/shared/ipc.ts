@@ -3,7 +3,8 @@
 
 /** Renderer -> main (invoke/handle). */
 export const IPC = {
-  // Navigation of the embedded web page (WebContentsView).
+  // Navigation of the embedded web pages. Each takes an optional tabId; omitted
+  // means "the active tab", which is what the address bar always sends.
   navigate: 'browser:navigate',
   goBack: 'browser:goBack',
   goForward: 'browser:goForward',
@@ -11,6 +12,11 @@ export const IPC = {
   setContentBounds: 'browser:setContentBounds',
   setSafeMode: 'browser:setSafeMode',
   clearSiteData: 'browser:clearSiteData',
+
+  // Tabs.
+  newTab: 'browser:newTab',
+  closeTab: 'browser:closeTab',
+  focusTab: 'browser:focusTab',
 
   // The malleability loop.
   adaptPrompt: 'acp:prompt',
@@ -39,6 +45,13 @@ export const IPC = {
   publishUserscript: 'lib:publishUserscript',
   openInTampermonkey: 'lib:openInTampermonkey',
 
+  // Bubbles: groups of sites whose edits may exchange data.
+  listBubbles: 'bubble:list',
+  saveBubble: 'bubble:save',
+  deleteBubble: 'bubble:delete',
+  setEditBubble: 'bubble:setEdit',
+  bubbleConsentResponse: 'bubble:consentResponse',
+
   // Agent-scaffolded tools (global + per-site).
   listTools: 'lib:listTools',
   deleteTool: 'lib:deleteTool',
@@ -56,9 +69,12 @@ export const IPC = {
 
 /** Main -> renderer (send/on). */
 export const EVT = {
-  navState: 'browser:navState',
+  /**
+   * The full tab set + which one is active. The address bar renders the active
+   * entry, so there is no separate "current page" channel to fall out of sync.
+   */
+  tabsState: 'browser:tabsState',
   adaptUpdate: 'acp:update',
-  adaptDone: 'acp:done',
   permissionRequest: 'acp:permissionRequest',
   acpStatus: 'acp:status',
   agentConfig: 'acp:config',
@@ -67,7 +83,11 @@ export const EVT = {
   /** The session list / current session changed. */
   sessions: 'acp:sessions',
   /** Ask the renderer to clear the transcript (e.g. before a session switch). */
-  clearTranscript: 'acp:clearTranscript'
+  clearTranscript: 'acp:clearTranscript',
+  /** The bubble list changed. */
+  bubbles: 'bubble:list',
+  /** A bubble wants to gain sites — the one consent point in the model. */
+  bubbleConsentRequest: 'bubble:consentRequest'
 } as const
 
 export interface Rect {
@@ -87,6 +107,63 @@ export interface NavState {
   origin: string
   /** Whether this origin has saved content adaptations. */
   adapted: boolean
+}
+
+/**
+ * One tab, as the renderer and the agent see it. `NavState` is this same shape
+ * minus the identity fields, kept separate so the address bar keeps working off a
+ * single "current page" subscription.
+ */
+export interface TabInfo {
+  id: string
+  url: string
+  title: string
+  /** Origin hostname, if any. */
+  origin: string
+  /** Whether this origin has saved content adaptations. */
+  adapted: boolean
+  isLoading: boolean
+  canGoBack: boolean
+  canGoForward: boolean
+  /** Worker tabs: alive and scriptable, but not in the strip. */
+  hidden: boolean
+  safeMode: boolean
+}
+
+export interface TabsState {
+  tabs: TabInfo[]
+  activeId: string | null
+}
+
+/** One edit, addressed by its host + id. */
+export interface BubbleEditRef {
+  host: string
+  editId: string
+}
+
+/**
+ * A bubble: a named group of sites whose edits may exchange data with each other
+ * and nothing outside. A host may be in many bubbles; an edit in exactly one.
+ */
+export interface Bubble {
+  id: string
+  name: string
+  /** Adaptation host slugs. Also the CORS allowlist for the bubble server. */
+  hosts: string[]
+  edits: BubbleEditRef[]
+  createdAt: number
+  updatedAt: number
+}
+
+/** Asked before a bubble gains sites — the one consent point in the model. */
+export interface BubbleConsentRequest {
+  requestId: string
+  /** Bubble name, existing or proposed. */
+  name: string
+  /** Sites being added by this request. */
+  adding: string[]
+  /** Sites already in the bubble, if it exists. */
+  existing: string[]
 }
 
 /** A normalized, render-friendly view of an ACP session/update notification. */

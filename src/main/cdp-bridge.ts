@@ -9,6 +9,12 @@ export interface CdpBridgeHandle {
   close: () => void
 }
 
+/** What the relay needs to know about a tab: its id and its live webContents. */
+export interface CdpTarget {
+  id: string
+  wc: WebContents
+}
+
 // CDP domains reasoned about and safe to hand over wholesale: DOM inspection/
 // mutation, JS evaluation, navigation/lifecycle, synthetic input, styling,
 // console logs, perf metrics, and read-only network (matches what
@@ -45,32 +51,43 @@ interface CdpRequest {
 }
 
 /**
- * Scoped, raw CDP-over-WebSocket relay for the one live content view — the
- * general escape hatch for automation the built-in MCP tools don't cover.
+ * Scoped, raw CDP-over-WebSocket relay for content tabs — the general escape
+ * hatch for automation the built-in MCP tools don't cover.
+ *
+ * Each WebSocket connection is pinned to exactly ONE tab, chosen by a `?tab=`
+ * ref at connect time and never changeable afterwards. That keeps the original
+ * single-target guarantee intact now that sibling tabs exist: a client can drive
+ * the tab it asked for and cannot pivot, because Target/Browser stay blocked and
+ * there is no in-band way to retarget. Events are tagged with `tabId` and fan
+ * out only to the clients pinned to that tab.
+ *
  * Reuses the debugger session PageInspector already attaches (page-inspector.ts
- * owns the one `wc.debugger.attach()` call); this only adds a second
- * `'message'` listener, which `wc.debugger` (a plain EventEmitter) supports
- * fine alongside PageInspector's own. Never creates a second CDP target and
- * never forwards Target/Browser/Storage/Emulation/Security/Fetch — see
- * BLOCKED_METHODS / ALLOWED_DOMAINS above.
+ * owns the one `wc.debugger.attach()` call per tab); this only adds a second
+ * `'message'` listener, which `wc.debugger` (a plain EventEmitter) supports fine
+ * alongside PageInspector's own. Never forwards Target/Browser/Storage/
+ * Emulation/Security/Fetch — see BLOCKED_METHODS / ALLOWED_DOMAINS above.
  */
-export async function startCdpBridge(getWc: () => WebContents | undefined): Promise<CdpBridgeHandle> {
+export async function startCdpBridge(
+  resolveTab: (ref?: string) => CdpTarget | undefined
+): Promise<CdpBridgeHandle> {
   const token = randomUUID()
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 })
-  let listenerAttached = false
+  // One listener per tab, and the set of clients pinned to it. Replaces the old
+  // one-shot latch, which would never have re-bound to a second tab.
+  const wired = new WeakSet<WebContents>()
+  const clients = new Map<WebContents, Set<WebSocket>>()
 
-  const broadcast = (frame: string): void => {
-    for (const ws of wss.clients) {
-      if (ws.readyState === ws.OPEN) ws.send(frame)
-    }
-  }
-
-  const ensureListener = (wc: WebContents): void => {
-    if (listenerAttached) return
-    listenerAttached = true
+  const ensureListener = (target: CdpTarget): void => {
+    const { id, wc } = target
+    if (wired.has(wc)) return
+    wired.add(wc)
     wc.debugger.on('message', (_event, method, params) => {
-      broadcast(JSON.stringify({ method, params }))
+      const frame = JSON.stringify({ tabId: id, method, params })
+      for (const ws of clients.get(wc) ?? []) {
+        if (ws.readyState === ws.OPEN) ws.send(frame)
+      }
     })
+    wc.once('destroyed', () => clients.delete(wc))
   }
 
   wss.on('connection', (ws: WebSocket, req) => {
@@ -79,12 +96,21 @@ export async function startCdpBridge(getWc: () => WebContents | undefined): Prom
       ws.close(4001, 'Unauthorized')
       return
     }
-    const wc = getWc()
-    if (!wc) {
-      ws.close(4004, 'No page loaded')
+    // Resolved once, at connect time. `tab` accepts a tab id or a host.
+    const target = resolveTab(reqUrl.searchParams.get('tab') ?? undefined)
+    if (!target) {
+      ws.close(4004, 'No such tab')
       return
     }
-    ensureListener(wc)
+    const wc = target.wc
+    ensureListener(target)
+    let set = clients.get(wc)
+    if (!set) {
+      set = new Set()
+      clients.set(wc, set)
+    }
+    set.add(ws)
+    ws.on('close', () => set!.delete(ws))
 
     ws.on('message', async (raw) => {
       let req: CdpRequest

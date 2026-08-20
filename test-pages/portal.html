@@ -1,0 +1,182 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Northwind Portal — Time Entry</title>
+<!--
+  MOCK DESTINATION SYSTEM for the cross-tab timesheet scenario.
+
+  Deliberately awkward, the way real client portals are:
+    * one entry at a time, not a week grid
+    * project CODES (WR-2024) instead of names ("Website Redesign")
+    * MM/DD/YYYY text dates instead of ISO
+    * hours as H:MM instead of decimal
+    * a confirm step before an entry is accepted
+  So a fill edit has to map vocabularies and drive a flow, not paste fields.
+-->
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.55 Verdana, Geneva, sans-serif; margin: 0;
+         background: #eceff1; color: #263238; }
+  header { background: #b71c1c; color: #fff; padding: 10px 20px; }
+  header h1 { margin: 0; font-size: 15px; font-weight: 700; }
+  header p { margin: 2px 0 0; font-size: 11px; opacity: .8; }
+  main { max-width: 720px; margin: 20px auto; padding: 0 16px; }
+  fieldset { background: #fff; border: 1px solid #cfd8dc; border-radius: 3px;
+             padding: 14px 16px 18px; margin: 0 0 20px; }
+  legend { font-size: 12px; font-weight: 700; text-transform: uppercase;
+           letter-spacing: .05em; color: #546e7a; padding: 0 6px; }
+  .field { display: flex; align-items: center; gap: 10px; margin: 9px 0; }
+  .field label { flex: 0 0 130px; font-size: 12px; color: #455a64; }
+  .field input, .field select { font: inherit; flex: 1; padding: 5px 7px;
+    border: 1px solid #b0bec5; border-radius: 2px; background: #fff; }
+  .field .note { flex: 0 0 auto; font-size: 11px; color: #90a4ae; }
+  .actions { margin-top: 14px; display: flex; gap: 8px; align-items: center; }
+  button { font: inherit; padding: 6px 14px; border-radius: 2px; cursor: pointer; }
+  #submit { background: #b71c1c; color: #fff; border: none; }
+  #submit:disabled { background: #bdbdbd; cursor: not-allowed; }
+  #clear { background: #fff; border: 1px solid #b0bec5; }
+  #err { color: #b71c1c; font-size: 12px; min-height: 16px; margin-top: 6px; }
+  table { width: 100%; border-collapse: collapse; background: #fff;
+          border: 1px solid #cfd8dc; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid #eceff1;
+           text-align: left; font-size: 13px; }
+  th { background: #f5f7f8; font-size: 11px; text-transform: uppercase;
+       letter-spacing: .05em; color: #546e7a; }
+  .empty { color: #90a4ae; font-style: italic; }
+  .hint { color: #607d8b; font-size: 11px; margin-top: 22px; }
+  code { background: #dfe4e6; padding: 1px 4px; font-size: 11px; }
+</style>
+
+<header>
+  <h1>NORTHWIND VENDOR PORTAL</h1>
+  <p>Time &amp; Expense &rsaquo; Weekly Time Entry</p>
+</header>
+
+<main>
+  <fieldset>
+    <legend>Add time entry</legend>
+    <form id="entry" autocomplete="off">
+      <div class="field">
+        <label for="wDate">Work date</label>
+        <input id="wDate" name="wDate" placeholder="MM/DD/YYYY" />
+        <span class="note">MM/DD/YYYY</span>
+      </div>
+      <div class="field">
+        <label for="pCode">Project code</label>
+        <select id="pCode" name="pCode">
+          <option value="">— select —</option>
+          <option value="WR-2024">WR-2024 · Web Redesign</option>
+          <option value="MOB-2024">MOB-2024 · Mobile Application</option>
+          <option value="INT-2024">INT-2024 · Internal Tooling</option>
+          <option value="SUP-2024">SUP-2024 · Support Retainer</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="dur">Duration</label>
+        <input id="dur" name="dur" placeholder="H:MM" />
+        <span class="note">e.g. 7:30</span>
+      </div>
+      <div class="field">
+        <label for="desc">Work performed</label>
+        <input id="desc" name="desc" />
+      </div>
+      <div class="actions">
+        <button id="submit" type="submit">Submit entry</button>
+        <button id="clear" type="reset">Clear</button>
+      </div>
+      <div id="err" role="alert"></div>
+    </form>
+  </fieldset>
+
+  <table id="ledger">
+    <thead>
+      <tr><th>Date</th><th>Code</th><th>Duration</th><th>Work performed</th></tr>
+    </thead>
+    <tbody id="ledger-rows">
+      <tr class="empty-row"><td colspan="4" class="empty">No entries submitted.</td></tr>
+    </tbody>
+  </table>
+
+  <p class="hint">
+    Mock destination system. Submitted entries persist under
+    <code>northwind.entries</code>. Project codes, the
+    <code>MM/DD/YYYY</code> date and the <code>H:MM</code> duration are
+    intentionally unlike the tracker's ISO dates, project names and decimal hours.
+  </p>
+</main>
+
+<script>
+  const KEY = 'northwind.entries'
+  const CODES = ['WR-2024', 'MOB-2024', 'INT-2024', 'SUP-2024']
+
+  const load = () => {
+    try { const a = JSON.parse(localStorage.getItem(KEY) || '[]'); return Array.isArray(a) ? a : [] }
+    catch { return [] }
+  }
+  let entries = load()
+
+  function renderLedger() {
+    const tb = document.getElementById('ledger-rows')
+    tb.textContent = ''
+    if (!entries.length) {
+      const tr = document.createElement('tr')
+      tr.className = 'empty-row'
+      const td = document.createElement('td')
+      td.colSpan = 4
+      td.className = 'empty'
+      td.textContent = 'No entries submitted.'
+      tr.appendChild(td)
+      tb.appendChild(tr)
+      return
+    }
+    entries.forEach((e) => {
+      const tr = document.createElement('tr')
+      tr.className = 'ledger-entry'
+      tr.dataset.date = e.wDate
+      tr.dataset.code = e.pCode
+      ;[e.wDate, e.pCode, e.dur, e.desc].forEach((v) => {
+        const td = document.createElement('td')
+        td.textContent = v
+        tr.appendChild(td)
+      })
+      tb.appendChild(tr)
+    })
+  }
+
+  // Validation is strict on purpose: a fill routine that guesses the formats wrong
+  // gets told so, instead of silently writing garbage.
+  function validate(v) {
+    if (!/^\d{2}\/\d{2}\/\d{4}$/.test(v.wDate)) return 'Work date must be MM/DD/YYYY.'
+    if (!CODES.includes(v.pCode)) return 'Select a project code.'
+    if (!/^\d{1,2}:[0-5]\d$/.test(v.dur)) return 'Duration must be H:MM (e.g. 7:30).'
+    if (!v.desc.trim()) return 'Work performed is required.'
+    return null
+  }
+
+  document.getElementById('entry').addEventListener('submit', (ev) => {
+    ev.preventDefault()
+    const v = {
+      wDate: document.getElementById('wDate').value.trim(),
+      pCode: document.getElementById('pCode').value,
+      dur: document.getElementById('dur').value.trim(),
+      desc: document.getElementById('desc').value.trim()
+    }
+    const err = validate(v)
+    document.getElementById('err').textContent = err || ''
+    if (err) return
+
+    // Idempotence guard: same date + code is treated as already entered, which is
+    // exactly the double-entry a push-to-all flow must not cause.
+    if (entries.some((e) => e.wDate === v.wDate && e.pCode === v.pCode)) {
+      document.getElementById('err').textContent = 'An entry already exists for that date and code.'
+      return
+    }
+    entries.push(v)
+    localStorage.setItem(KEY, JSON.stringify(entries))
+    renderLedger()
+    document.getElementById('entry').reset()
+    document.dispatchEvent(new CustomEvent('portal:submitted', { detail: v }))
+  })
+
+  renderLedger()
+</script>

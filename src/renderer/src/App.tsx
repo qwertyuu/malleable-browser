@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Chrome from './components/Chrome'
+import TabStrip from './components/TabStrip'
+import BubbleConsent from './components/BubbleConsent'
 import AdaptPanel from './components/AdaptPanel'
 import type {
   NavState,
+  TabsState,
   AdaptUpdate,
   AcpStatus,
   PermissionRequestDTO,
   Activity,
   AgentConfig,
-  SessionList
+  SessionList,
+  Bubble,
+  BubbleConsentRequest
 } from '../../shared/ipc'
 
 export type Tab = 'adapt' | 'library' | 'settings'
@@ -26,9 +31,11 @@ const DEFAULT_NAV: NavState = {
 const IDLE: Activity = { state: 'idle' }
 
 export default function App() {
-  const [nav, setNav] = useState<NavState>(DEFAULT_NAV)
+  // One source of truth for browsing state. TabInfo is a superset of NavState, so
+  // the address bar reads the active entry rather than tracking its own copy —
+  // nothing to keep in sync, and per-tab flags (safe mode) come along for free.
+  const [tabsState, setTabsState] = useState<TabsState>({ tabs: [], activeId: null })
   const [panelOpen, setPanelOpen] = useState(true)
-  const [safeMode, setSafeMode] = useState(false)
   const [status, setStatus] = useState<AcpStatus>({ state: 'starting' })
   const [config, setConfig] = useState<AgentConfig | null>(null)
   const [sessions, setSessions] = useState<SessionList>({ sessions: [], currentId: null })
@@ -43,11 +50,19 @@ export default function App() {
   const [activityMap, setActivityMap] = useState<Record<string, Activity>>({})
   // Concurrent turns can each raise a permission prompt; queue them, show one at a time.
   const [permissions, setPermissions] = useState<PermissionRequestDTO[]>([])
+  const [bubbles, setBubbles] = useState<Bubble[]>([])
+  // Same queueing as permissions: a turn could propose more than one bubble.
+  const [consents, setConsents] = useState<BubbleConsentRequest[]>([])
+
+  const activeTab = tabsState.tabs.find((t) => t.id === tabsState.activeId) ?? null
+  const nav: NavState = activeTab ?? DEFAULT_NAV
+  const safeMode = activeTab?.safeMode ?? false
 
   const updates = currentId ? (transcripts[currentId] ?? []) : []
   const busy = currentId ? (busyMap[currentId] ?? false) : false
   const activity = currentId ? (activityMap[currentId] ?? IDLE) : IDLE
   const permission = permissions[0] ?? null
+  const consent = consents[0] ?? null
   const busySessions = Object.keys(busyMap).filter((id) => busyMap[id])
 
   /** Append one update to a specific session's transcript (coalescing streams/tools). */
@@ -88,7 +103,11 @@ export default function App() {
   // are routed into their session's slice by id, so a background thread keeps
   // filling its own transcript while you look at another.
   useEffect(() => {
-    const offNav = window.api.onNavState(setNav)
+    const offTabs = window.api.onTabsState(setTabsState)
+    const offBubbles = window.api.onBubbles(setBubbles)
+    const offConsent = window.api.onBubbleConsentRequest((r) =>
+      setConsents((prev) => [...prev, r])
+    )
     const offStatus = window.api.onAcpStatus(setStatus)
     const offPerm = window.api.onPermissionRequest((r) => {
       setPermissions((prev) => [...prev, r])
@@ -115,12 +134,15 @@ export default function App() {
       setActivityMap({})
       setPermissions([])
     })
+    void window.api.listBubbles().then(setBubbles)
     void window.api.listSessions().then((list) => {
       setSessions(list)
       setCurrentId(list.currentId)
     })
     return () => {
-      offNav()
+      offTabs()
+      offBubbles()
+      offConsent()
       offStatus()
       offPerm()
       offUpdate()
@@ -199,11 +221,17 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [newSession])
 
+  // Per-tab now, and main echoes the new value back via tabsState, so there is no
+  // local copy to flip optimistically.
   const toggleSafeMode = useCallback(() => {
-    setSafeMode((prev) => {
-      const next = !prev
-      void window.api.setSafeMode(next)
-      return next
+    void window.api.setSafeMode(!safeMode)
+  }, [safeMode])
+
+  const answerConsent = useCallback((allow: boolean) => {
+    setConsents((prev) => {
+      const [head, ...rest] = prev
+      if (head) void window.api.respondBubbleConsent(head.requestId, allow)
+      return rest
     })
   }, [])
 
@@ -217,6 +245,13 @@ export default function App() {
 
   return (
     <div className="app">
+      <TabStrip
+        tabs={tabsState.tabs}
+        activeId={tabsState.activeId}
+        onSelect={(id) => window.api.focusTab(id)}
+        onClose={(id) => window.api.closeTab(id)}
+        onNew={() => window.api.newTab()}
+      />
       <Chrome
         nav={nav}
         panelOpen={panelOpen}
@@ -228,6 +263,11 @@ export default function App() {
         onForward={() => window.api.goForward()}
         onReload={() => window.api.reload()}
       />
+      {consent && (
+        <div className="consent-scrim">
+          <BubbleConsent request={consent} onAnswer={answerConsent} />
+        </div>
+      )}
       <div className="body">
         <div className="content-slot" ref={slotRef} data-testid="content-slot" />
         {panelOpen && (
@@ -266,7 +306,7 @@ export default function App() {
               window.api.setConfigOption(configId, value)
             }}
             onResetSite={async () => {
-              await window.api.resetSite()
+              await window.api.resetSite(nav.origin)
               if (currentId)
                 appendTo(currentId, {
                   kind: 'info',

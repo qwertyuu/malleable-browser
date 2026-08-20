@@ -1,7 +1,18 @@
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import type { WebContents } from 'electron'
-import type { EditMeta, EditSummary, HostAdaptations, EditContent } from '../shared/ipc.js'
+import type { EditMeta, EditSummary, HostAdaptations, EditContent, Bubble } from '../shared/ipc.js'
+import { buildMalSource } from './mal-shim.js'
+
+/**
+ * How an edit reaches its bubble, if it has one. Supplied by main so this class
+ * stays unaware of the server; `bubbleFor` is the authorization lookup.
+ */
+export interface MalContext {
+  endpoint: string
+  token: string
+  bubbleFor: (host: string, editId: string) => Promise<Bubble | null>
+}
 
 /**
  * Per-site content adaptations, as a LIBRARY of independently-toggleable named
@@ -183,8 +194,15 @@ export class Adaptations {
     return false
   }
 
-  /** Inject every enabled edit for `url`'s origin into a live page. */
-  async apply(wc: WebContents, url: string): Promise<void> {
+  /**
+   * Inject every enabled edit for `url`'s origin into a live page.
+   *
+   * Each edit's JS is wrapped in its own guarded IIFE taking one argument, `mal`
+   * — the edit's bubble handle, or null when it belongs to no bubble. Passing it
+   * as an ARGUMENT rather than a global is what keeps it out of the page world:
+   * it's a local inside the edit's closure, invisible to the site's own scripts.
+   */
+  async apply(wc: WebContents, url: string, ctx?: MalContext): Promise<void> {
     const host = this.slugFor(url)
     if (!host) return
     for (const e of await this.listForHost(host)) {
@@ -192,7 +210,21 @@ export class Adaptations {
       const { css, js } = await this.readFiles(host, e.id)
       if (css.trim()) await wc.insertCSS(css).catch(() => {})
       if (js.trim()) {
-        const wrapped = `(function(){try{\n${js}\n}catch(e){console.error('[malleable ${e.id}]', e)}})()`
+        let mal = 'null'
+        if (ctx) {
+          const bubble = await ctx.bubbleFor(host, e.id)
+          if (bubble) {
+            mal = buildMalSource({
+              endpoint: ctx.endpoint,
+              token: ctx.token,
+              bubbleId: bubble.id,
+              bubbleName: bubble.name,
+              hosts: bubble.hosts,
+              editId: e.id
+            })
+          }
+        }
+        const wrapped = `(function(mal){try{\n${js}\n}catch(e){console.error('[malleable ${e.id}]', e)}})(${mal})`
         await wc.executeJavaScript(wrapped, true).catch(() => {})
       }
     }
@@ -209,12 +241,26 @@ export class Adaptations {
     persona?: string
     /** Whether the target host is the page currently on screen. */
     live?: boolean
+    /** Other open tabs, so cross-site work doesn't need a tool call to discover. */
+    tabs?: { id: string; host: string; title: string; active: boolean }[]
+    /** Bubbles this host already belongs to. */
+    bubbles?: Bubble[]
   }): string {
     const existing = args.edits.length
       ? args.edits
           .map((e) => `  - ${e.id} · "${e.name}" [${e.kind}] ${e.enabled ? '(on)' : '(off)'}`)
           .join('\n')
       : '  (none yet)'
+    const tabList = args.tabs?.length
+      ? args.tabs
+          .map((t) => `  - ${t.id} · ${t.host || '(no host)'}${t.active ? ' (focused)' : ''} — ${t.title}`)
+          .join('\n')
+      : null
+    const bubbleList = args.bubbles?.length
+      ? args.bubbles
+          .map((b) => `  - ${b.id} · "${b.name}" — sites: ${b.hosts.join(', ')}`)
+          .join('\n')
+      : null
     return [
       ...(args.persona ? [args.persona, '', '— — —', ''] : []),
       'You are the page-adaptation engine for a "malleable browser". The user is',
@@ -234,14 +280,37 @@ export class Adaptations {
       'in separate edits (e.g. one "Dark theme" [theme] and one "Hide ads" [cleanup])',
       'rather than one giant edit — the user toggles them individually.',
       '',
+      'CROSS-SITE WORK (moving data between sites, e.g. re-entering the same',
+      'timesheet in several systems). Sites cannot see each other by default. To let',
+      'them, put their edits in a BUBBLE — a named group of sites whose edits may',
+      'exchange data with each other and nothing outside:',
+      '  save_bubble({ name, hosts })   — creates it; ASKS THE USER to approve the',
+      '     sites. This is the only consent prompt; after it, no further prompting.',
+      '  set_edit_bubble({ id, bubble }) — put an edit in it. An edit gets its `mal`',
+      '     handle ONLY once it is in a bubble. One bubble per edit; write two edits',
+      '     if two features need the same site.',
+      'Inside a bubble, an edit\'s JS receives a `mal` argument (null when the edit is',
+      'in no bubble) — always guard with `if (!mal) return`:',
+      '  await mal.state.set(key, value) / mal.state.get(key) / mal.state.all()',
+      '  mal.state.watch(key, fn)  — fires live when another site writes that key',
+      '  mal.bus.publish(ch, v) / mal.bus.subscribe(ch, fn)  — ephemeral, not stored',
+      '  mal.bubble.hosts          — the sites in this bubble',
+      'State is JSON, persisted, and shared by every site in the bubble. The usual',
+      'shape is one EXTRACT edit on the source site writing state, and one FILL edit',
+      'per destination site that watches it and offers the user a button. Destination',
+      'systems rarely accept the source\'s formats — expect to map dates, units and',
+      'vocabularies in the fill edit.',
+      '',
       args.live === false
         ? `NOTE: "${args.host}" is NOT the page currently on screen. Pass host:"${args.host}" to the adaptation tools. Live page tools reflect the current page, which may differ — prefer editing existing edits by id.`
         : 'Inspect the LIVE page first with dom_query / run_js / screenshot / get_console / get_network (no HTML is included here). Verify selectors against the real DOM and screenshot after saving to confirm. CSS for looks; JS only for behavior; keep overlay JS idempotent. If these don\'t fit — e.g. real automation, or reading page history without re-deriving it — you also have .malleable/cdp.json (a raw CDP endpoint for this page; connect with any CDP-speaking approach) and live/<host>/{network,console}.jsonl (grep/tail-able history), the same reach any other automation on this machine would have.',
       '',
       `Current page: ${args.title} — ${args.url}`,
       `Host: ${args.host}`,
+      ...(tabList ? ['Open tabs:', tabList] : []),
       'Existing edits for this host:',
       existing,
+      ...(bubbleList ? ['Bubbles including this host:', bubbleList] : []),
       '',
       `User request: ${args.request}`
     ].join('\n')

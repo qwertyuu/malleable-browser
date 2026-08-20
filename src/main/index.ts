@@ -1,15 +1,19 @@
-import { app, BrowserWindow, WebContentsView, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, session, shell } from 'electron'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { promises as fsp } from 'node:fs'
 import { AcpClient } from './acp-client.js'
 import { Checkpoints } from './checkpoint.js'
 import { Adaptations } from './adaptations.js'
+import { Bubbles } from './bubbles.js'
+import { startBubbleServer, type BubbleServerHandle } from './bubble-server.js'
+import { installCspRelaxation } from './csp.js'
 import { publishHostAsExtension } from './publish-extension.js'
 import { publishHostAsUserscript } from './publish-userscript.js'
 import { SessionStore } from './sessions.js'
 import { Logger } from './logger.js'
-import { PageInspector } from './page-inspector.js'
+import { TabManager, type TabRecord } from './tabs.js'
 import { startPageToolsServer, type PageToolsHandle } from './page-tools-server.js'
 import { startCdpBridge, type CdpBridgeHandle } from './cdp-bridge.js'
 import { DynamicTools } from './dynamic-tools.js'
@@ -19,7 +23,10 @@ import {
   IPC,
   EVT,
   type Rect,
-  type NavState,
+  type TabInfo,
+  type TabsState,
+  type Bubble,
+  type BubbleConsentRequest,
   type AdaptResult,
   type PermissionRequestDTO
 } from '../shared/ipc.js'
@@ -35,26 +42,42 @@ const DEFAULT_URL = 'https://example.com'
 const TAMPERMONKEY_ID = 'dhdgffkkebhmkfjojejmpbldmpobfkfo'
 
 let win: BrowserWindow | null = null
-let contentView: WebContentsView | null = null
 let acp: AcpClient | null = null
 // Safe Mode: strip the browser's automation fingerprint (CDP debugger attached,
 // Electron-flavored user agent, injected adaptations) for sites — banks, mostly —
 // whose bot/fraud detection blocks anything that doesn't look like stock Chrome.
-let safeMode = false
+// Per-tab (TabRecord.safeMode): one bank tab shouldn't de-fingerprint every page.
 let defaultUserAgent = ''
 let safeUserAgent = ''
 const checkpoints = new Checkpoints(WORKSPACE)
 const adaptations = new Adaptations(WORKSPACE)
+const bubbles = new Bubbles(WORKSPACE)
 const dynamicTools = new DynamicTools(WORKSPACE)
 const sessions = new SessionStore(WORKSPACE)
 const logger = new Logger(join(WORKSPACE, 'logs'))
-const pageInspector = new PageInspector(
-  () => contentView?.webContents,
-  () => adaptations.slugFor(contentView?.webContents.getURL() ?? ''),
-  WORKSPACE
-)
+const tabs = new TabManager({
+  workspace: WORKSPACE,
+  slugFor: (url) => adaptations.slugFor(url),
+  defaultUrl: DEFAULT_URL,
+  hooks: {
+    onNav: () => void emitTabs(),
+    onDomReady: (tab) => {
+      // Inject this origin's saved adaptations into every page load. Early
+      // (dom-ready) so styles apply before paint; JS is guarded inside apply().
+      // Skipped in Safe Mode, which aims to look exactly like stock Chrome.
+      if (tab.safeMode) return
+      const wc = tab.view.webContents
+      void adaptations.apply(wc, wc.getURL(), malContext())
+    },
+    onTabsChanged: () => void emitTabs()
+  }
+})
 const appSettings = new AppSettings(join(app.getPath('userData'), 'settings.json'))
 let pageTools: PageToolsHandle | null = null
+let bubbleServer: BubbleServerHandle | null = null
+// Hosts that belong to at least one bubble. Kept as a plain synchronous set
+// because the CSP header hook runs on every response and cannot await disk.
+const bubbleHosts = new Set<string>()
 let cdpBridge: CdpBridgeHandle | null = null
 
 /** Create the workspace and make it a git repo so checkpoints/revert work. */
@@ -62,6 +85,9 @@ async function ensureWorkspace(): Promise<void> {
   await fsp.mkdir(WORKSPACE, { recursive: true })
   await fsp.mkdir(join(WORKSPACE, 'adaptations'), { recursive: true })
   await fsp.mkdir(join(WORKSPACE, 'tools'), { recursive: true })
+  // Bubble membership is a durable artifact and IS checkpointed; the state the
+  // bubble server holds is churning runtime data and lives under .malleable/.
+  await fsp.mkdir(join(WORKSPACE, 'bubbles'), { recursive: true })
   // live/ holds raw captured network+console history (headers/bodies can carry
   // auth tokens/cookies) — kept out of checkpoints, same treatment as logs/.
   await fsp.writeFile(join(WORKSPACE, '.gitignore'), 'logs/\n.malleable/\nlive/\n', 'utf8').catch(() => {})
@@ -80,6 +106,26 @@ async function ensureWorkspace(): Promise<void> {
 
 // Pending permission requests keyed by requestId; resolved by the renderer.
 const pendingPermissions = new Map<string, (optionId: string | null) => void>()
+// Same pattern for bubble consent: the ONE gate in the bubble model. Asked when a
+// bubble gains sites, never per call, so approving a bubble once is the whole
+// grant — and declining leaves the bubble exactly as it was.
+const pendingConsents = new Map<string, (allow: boolean) => void>()
+
+function askBubbleConsent(
+  id: string | undefined,
+  name: string,
+  adding: string[]
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const requestId = randomUUID()
+    const req: BubbleConsentRequest = { requestId, name, adding, existing: [] }
+    pendingConsents.set(requestId, resolve)
+    void (async () => {
+      const existing = id ? await bubbles.get(id) : null
+      sendToChrome(EVT.bubbleConsentRequest, { ...req, existing: existing?.hosts ?? [] })
+    })()
+  })
+}
 
 function sendToChrome(channel: string, payload: unknown): void {
   if (!win) return
@@ -96,29 +142,49 @@ function sendToChrome(channel: string, payload: unknown): void {
   }
 }
 
-async function emitNavState(): Promise<void> {
-  const wc = contentView?.webContents
-  if (!wc) return
+async function describeTab(tab: TabRecord): Promise<TabInfo> {
+  const wc = tab.view.webContents
+  if (wc.isDestroyed()) {
+    return {
+      id: tab.id, url: '', title: '', origin: '', adapted: false,
+      isLoading: false, canGoBack: false, canGoForward: false,
+      hidden: tab.hidden, safeMode: tab.safeMode
+    }
+  }
   const url = wc.getURL()
   const slug = adaptations.slugFor(url)
-  const state: NavState = {
+  return {
+    id: tab.id,
     url,
-    canGoBack: wc.navigationHistory.canGoBack(),
-    canGoForward: wc.navigationHistory.canGoForward(),
-    isLoading: wc.isLoading(),
     title: wc.getTitle(),
     origin: slug ?? '',
-    adapted: slug ? await adaptations.hasEnabled(slug) : false
+    adapted: slug ? await adaptations.hasEnabled(slug) : false,
+    isLoading: wc.isLoading(),
+    canGoBack: wc.navigationHistory.canGoBack(),
+    canGoForward: wc.navigationHistory.canGoForward(),
+    hidden: tab.hidden,
+    safeMode: tab.safeMode
   }
-  // Re-scope the agent's site tools to the page it's now on.
-  pageTools?.syncSiteTools(slug ?? null)
-  sendToChrome(EVT.navState, state)
 }
 
-/** Reload the visible page and wait for load — used after the agent saves an edit. */
-async function reloadCurrent(): Promise<void> {
-  const wc = contentView?.webContents
-  if (!wc) return
+/**
+ * Push the whole tab set. TabInfo is a superset of the old single-page NavState,
+ * so the address bar just reads the active entry — one channel, one computation,
+ * no way for the strip and the address bar to disagree.
+ */
+async function emitTabs(): Promise<void> {
+  const infos = await Promise.all(tabs.visible().map(describeTab))
+  const activeId = tabs.activeId
+  const state: TabsState = { tabs: infos, activeId }
+  // Re-scope the agent's site tools to the page it's focused on.
+  pageTools?.syncSiteTools(infos.find((t) => t.id === activeId)?.origin || null)
+  sendToChrome(EVT.tabsState, state)
+}
+
+/** Reload one tab and wait for load — used after the agent saves an edit. */
+async function reloadTab(tab: TabRecord | undefined): Promise<void> {
+  const wc = tab?.view.webContents
+  if (!wc || wc.isDestroyed()) return
   await new Promise<void>((resolve) => {
     let done = false
     const finish = (): void => {
@@ -133,10 +199,24 @@ async function reloadCurrent(): Promise<void> {
   })
 }
 
-/** If the edited/toggled host is the one on screen, reload so changes take effect. */
-function reapplyIfCurrent(host: string): void {
-  const wc = contentView?.webContents
-  if (wc && adaptations.slugFor(wc.getURL()) === host) wc.reload()
+/** Reload the tab the agent is working on (its `tab` arg, else the active one). */
+async function reloadCurrent(ref?: string): Promise<void> {
+  await reloadTab(tabs.resolve(ref))
+}
+
+/**
+ * Reload EVERY tab showing the edited host, not just the focused one — with
+ * multiple tabs open the same site can be on screen more than once.
+ */
+function reapplyForHost(host: string): void {
+  for (const t of tabs.forHost(host)) {
+    if (!t.view.webContents.isDestroyed()) t.view.webContents.reload()
+  }
+}
+
+/** Same, but await every reload — the agent needs the edit visible before it looks. */
+async function reloadHost(host: string): Promise<void> {
+  await Promise.all(tabs.forHost(host).map((t) => reloadTab(t)))
 }
 
 /**
@@ -148,10 +228,31 @@ function deriveSafeUserAgent(ua: string): string {
   return ua.replace(/\s*\S+\/[\d.]+(?=\s+Chrome\/)/, '').replace(/\s*Electron\/[\d.]+/, '')
 }
 
+/**
+ * Bubble wiring handed to the injector. Undefined until the bubble server is up,
+ * in which case edits get `mal === null` and simply have no cross-tab reach.
+ */
+function malContext(): { endpoint: string; token: string; bubbleFor: (h: string, e: string) => Promise<Bubble | null> } | undefined {
+  if (!bubbleServer) return undefined
+  return {
+    endpoint: bubbleServer.url,
+    token: bubbleServer.token,
+    bubbleFor: (host, editId) => bubbles.bubbleForEdit(host, editId)
+  }
+}
+
+/** Refresh the CSP allowlist + notify the renderer after any bubble change. */
+async function refreshBubbles(): Promise<void> {
+  const all = await bubbles.list()
+  bubbleHosts.clear()
+  for (const b of all) for (const h of b.hosts) bubbleHosts.add(h)
+  sendToChrome(EVT.bubbles, all)
+}
+
 /** Lightweight page identity. The agent pulls DOM/console/etc. via its tools. */
-async function capturePage(): Promise<{ url: string; title: string } | null> {
-  const wc = contentView?.webContents
-  if (!wc) return null
+async function capturePage(tab: TabRecord | undefined): Promise<{ url: string; title: string } | null> {
+  const wc = tab?.view.webContents
+  if (!wc || wc.isDestroyed()) return null
   try {
     return await wc.executeJavaScript(
       `({ url: location.href, title: document.title })`
@@ -159,49 +260,6 @@ async function capturePage(): Promise<{ url: string; title: string } | null> {
   } catch {
     return null
   }
-}
-
-function createContentView(): void {
-  // Sandboxed view for arbitrary/untrusted web content. It has NO preload and no
-  // Node access — Claude's file/terminal power lives in the main process only and
-  // is unreachable from rendered pages.
-  contentView = new WebContentsView({
-    webPreferences: {
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  })
-  win!.contentView.addChildView(contentView)
-  contentView.setBounds({ x: 0, y: 0, width: 0, height: 0 })
-
-  const wc = contentView.webContents
-  defaultUserAgent = wc.userAgent
-  safeUserAgent = deriveSafeUserAgent(defaultUserAgent)
-
-  wc.on('did-navigate', () => void emitNavState())
-  wc.on('did-navigate-in-page', () => void emitNavState())
-  wc.on('did-start-loading', () => void emitNavState())
-  wc.on('did-stop-loading', () => void emitNavState())
-  wc.on('page-title-updated', () => void emitNavState())
-
-  // Inject this origin's saved content adaptation into every page load. Early
-  // (dom-ready) so styles apply before paint; JS is guarded inside apply(). Skipped
-  // in Safe Mode, which aims to look exactly like stock Chrome.
-  wc.on('dom-ready', () => {
-    if (!safeMode) void adaptations.apply(wc, wc.getURL())
-  })
-
-  // Wire console + network capture for the agent's page-inspection tools.
-  pageInspector.attach(wc)
-
-  // Open target=_blank / window.open in the same view rather than a native window.
-  wc.setWindowOpenHandler(({ url }) => {
-    wc.loadURL(url).catch(() => {})
-    return { action: 'deny' }
-  })
-
-  wc.loadURL(DEFAULT_URL).catch(() => {})
 }
 
 function createWindow(): void {
@@ -219,9 +277,11 @@ function createWindow(): void {
   })
 
   win.on('closed', () => {
+    tabs.destroyAll()
     win = null
-    contentView = null
   })
+
+  tabs.attachWindow(win)
 
   // Load the React chrome (dev server in `dev`, built file otherwise).
   const devUrl = process.env.ELECTRON_RENDERER_URL
@@ -231,45 +291,56 @@ function createWindow(): void {
     win.loadFile(join(__dirname, '../renderer/index.html'))
   }
 
-  createContentView()
+  // The first tab. Its webContents supplies the UA pair Safe Mode toggles between.
+  const first = tabs.create({})
+  defaultUserAgent = first.view.webContents.userAgent
+  safeUserAgent = deriveSafeUserAgent(defaultUserAgent)
 }
 
 function wireIpc(): void {
-  ipcMain.handle(IPC.navigate, (_e, url: string) => {
-    contentView?.webContents.loadURL(normalizeUrl(url)).catch(() => {})
+  ipcMain.handle(IPC.navigate, (_e, url: string, tabId?: string) => {
+    tabs.resolve(tabId)?.view.webContents.loadURL(normalizeUrl(url)).catch(() => {})
   })
-  ipcMain.handle(IPC.goBack, () => {
-    const wc = contentView?.webContents
+  ipcMain.handle(IPC.goBack, (_e, tabId?: string) => {
+    const wc = tabs.resolve(tabId)?.view.webContents
     if (wc?.navigationHistory.canGoBack()) wc.navigationHistory.goBack()
   })
-  ipcMain.handle(IPC.goForward, () => {
-    const wc = contentView?.webContents
+  ipcMain.handle(IPC.goForward, (_e, tabId?: string) => {
+    const wc = tabs.resolve(tabId)?.view.webContents
     if (wc?.navigationHistory.canGoForward()) wc.navigationHistory.goForward()
   })
-  ipcMain.handle(IPC.reload, () => contentView?.webContents.reload())
+  ipcMain.handle(IPC.reload, (_e, tabId?: string) => tabs.resolve(tabId)?.view.webContents.reload())
 
-  ipcMain.handle(IPC.setContentBounds, (_e, r: Rect) => {
-    contentView?.setBounds({
-      x: Math.round(r.x),
-      y: Math.round(r.y),
-      width: Math.max(0, Math.round(r.width)),
-      height: Math.max(0, Math.round(r.height))
-    })
+  // One content rect for all tabs; TabManager toggles which one is visible.
+  ipcMain.handle(IPC.setContentBounds, (_e, r: Rect) => tabs.setBounds(r))
+
+  // ---- Tabs ----
+  ipcMain.handle(IPC.newTab, (_e, url?: string) => {
+    tabs.create({ url: url ? normalizeUrl(url) : undefined })
+  })
+  ipcMain.handle(IPC.closeTab, (_e, tabId: string) => {
+    tabs.close(tabId)
+  })
+  ipcMain.handle(IPC.focusTab, (_e, tabId: string) => {
+    tabs.focus(tabId)
   })
 
   // Safe Mode: drop the automation fingerprint for the current page (CDP debugger,
   // Electron UA, adaptations) and reload so the site sees a stock-Chrome identity.
   // Turning it off doesn't force the debugger back on — that only happens lazily
   // when the agent is actually asked to work on a page (see adaptPrompt/adaptHost).
-  ipcMain.handle(IPC.setSafeMode, (_e, enabled: boolean) => {
-    safeMode = enabled
-    const wc = contentView?.webContents
-    if (wc) {
-      if (enabled) pageInspector.setCaptureEnabled(wc, false)
+  ipcMain.handle(IPC.setSafeMode, (_e, enabled: boolean, tabId?: string) => {
+    const tab = tabs.resolve(tabId)
+    if (!tab) return { ok: false, enabled: false }
+    tab.safeMode = enabled
+    const wc = tab.view.webContents
+    if (!wc.isDestroyed()) {
+      if (enabled) tab.inspector.setCaptureEnabled(wc, false)
       wc.setUserAgent(enabled ? safeUserAgent : defaultUserAgent)
       wc.reload()
     }
-    logger.log('info', 'safeMode.set', { enabled })
+    logger.log('info', 'safeMode.set', { tab: tab.id, enabled })
+    void emitTabs()
     return { ok: true, enabled }
   })
 
@@ -277,8 +348,8 @@ function wireIpc(): void {
   // reload. Ordinary "clear site data" hygiene — useful when a site's own state
   // (e.g. a bot-detection risk cookie) got stuck in a bad state and needs a clean
   // slate, the same way clearing cookies in any browser would.
-  ipcMain.handle(IPC.clearSiteData, async () => {
-    const wc = contentView?.webContents
+  ipcMain.handle(IPC.clearSiteData, async (_e, tabId?: string) => {
+    const wc = tabs.resolve(tabId)?.view.webContents
     const url = wc?.getURL()
     if (!wc || !url) return { ok: false }
     const ses = wc.session
@@ -293,14 +364,15 @@ function wireIpc(): void {
   // ---- The malleability loop: adapt the CURRENT PAGE ----
   ipcMain.handle(IPC.adaptPrompt, async (_e, sessionId: string, text: string): Promise<AdaptResult> => {
     if (!acp) return { ok: false, error: 'ACP not started' }
-    const page = await capturePage()
-    if (!page) return { ok: false, error: 'No page loaded to adapt' }
+    const tab = tabs.active()
+    const page = await capturePage(tab)
+    if (!page || !tab) return { ok: false, error: 'No page loaded to adapt' }
     const slug = adaptations.slugFor(page.url)
     if (!slug) return { ok: false, error: 'This page has no adaptable origin' }
 
     // Turn on CDP network/console capture now that the agent is actually about to
     // work on this page (Safe Mode overrides this and keeps it off regardless).
-    if (!safeMode) pageInspector.setCaptureEnabled(contentView?.webContents, true)
+    if (!tab.safeMode) tab.inspector.setCaptureEnabled(tab.view.webContents, true)
 
     const statusBefore = await checkpoints.status()
     if (sessionId) {
@@ -316,7 +388,14 @@ function wireIpc(): void {
       host: slug,
       edits: await adaptations.listForHost(slug),
       request: text,
-      persona: await loadPersona(WORKSPACE)
+      persona: await loadPersona(WORKSPACE),
+      tabs: tabs.list().map((t) => ({
+        id: t.id,
+        host: tabs.hostOf(t) ?? '',
+        title: t.view.webContents.isDestroyed() ? '' : t.view.webContents.getTitle(),
+        active: t.id === tabs.activeId
+      })),
+      bubbles: await bubbles.bubblesForHost(slug)
     })
     const res = await acp.prompt(sessionId, prompt)
 
@@ -324,7 +403,7 @@ function wireIpc(): void {
     const checkpoint = treeChanged
       ? ((await checkpoints.commitArtifacts(`${slug}: ${text.slice(0, 60)}`)) ?? undefined)
       : undefined
-    void emitNavState()
+    void emitTabs()
     logger.log('info', 'adapt.result', { host: slug, ok: !res.error, treeChanged, checkpoint })
     return { ok: !res.error, stopReason: res.stopReason, error: res.error, checkpoint }
   })
@@ -338,29 +417,40 @@ function wireIpc(): void {
       if (!acp) return { ok: false, error: 'ACP not started' }
       // Same lazy capture-on as adaptPrompt — only instrument the page once the
       // agent is actually asked to work on it.
-      if (!safeMode) pageInspector.setCaptureEnabled(contentView?.webContents, true)
+      // Prefer a tab already showing this host over whatever happens to be focused.
+      const hostTab = tabs.forHost(host)[0] ?? tabs.active()
+      if (hostTab && !hostTab.safeMode) {
+        hostTab.inspector.setCaptureEnabled(hostTab.view.webContents, true)
+      }
       const statusBefore = await checkpoints.status()
       if (sessionId) {
         await sessions.setTitleIfDefault(sessionId, text)
         sendToChrome(EVT.sessions, sessions.list())
       }
       logger.log('info', 'adapt.host', { sessionId, host, request: text })
-      const onCurrent = adaptations.slugFor(contentView?.webContents.getURL() ?? '') === host
+      const onCurrent = hostTab ? tabs.hostOf(hostTab) === host : false
       const prompt = adaptations.buildPrompt({
-        url: onCurrent ? (contentView?.webContents.getURL() ?? '') : `https://${host}/`,
+        url: onCurrent && hostTab ? tabs.urlOf(hostTab) : `https://${host}/`,
         title: host,
         host,
         edits: await adaptations.listForHost(host),
         request: text,
         persona: await loadPersona(WORKSPACE),
-        live: onCurrent
+        live: onCurrent,
+        tabs: tabs.list().map((t) => ({
+          id: t.id,
+          host: tabs.hostOf(t) ?? '',
+          title: t.view.webContents.isDestroyed() ? '' : t.view.webContents.getTitle(),
+          active: t.id === tabs.activeId
+        })),
+        bubbles: await bubbles.bubblesForHost(host)
       })
       const res = await acp.prompt(sessionId, prompt)
       const treeChanged = (await checkpoints.status()) !== statusBefore
       const checkpoint = treeChanged
         ? ((await checkpoints.commitArtifacts(`${host}: ${text.slice(0, 60)}`)) ?? undefined)
         : undefined
-      void emitNavState()
+      void emitTabs()
       logger.log('info', 'adapt.host.result', { host, ok: !res.error, treeChanged, checkpoint })
       return { ok: !res.error, stopReason: res.stopReason, error: res.error, checkpoint }
     }
@@ -382,13 +472,17 @@ function wireIpc(): void {
     return res
   })
 
-  ipcMain.handle(IPC.resetSite, async () => {
-    const wc = contentView?.webContents
-    const slug = wc ? adaptations.slugFor(wc.getURL()) : null
+  // Takes an explicit host now that "the current page" is ambiguous; the renderer
+  // passes the active tab's origin, and omitting it still falls back to that.
+  ipcMain.handle(IPC.resetSite, async (_e, host?: string) => {
+    const slug = host || (() => {
+      const t = tabs.active()
+      return t ? tabs.hostOf(t) : null
+    })()
     if (!slug) return { ok: false }
     await adaptations.clearHost(slug)
-    wc?.reload()
-    void emitNavState()
+    reapplyForHost(slug)
+    void emitTabs()
     return { ok: true }
   })
 
@@ -413,20 +507,22 @@ function wireIpc(): void {
     IPC.saveEdit,
     async (_e, host: string, edit: { id?: string; name: string; kind?: string; css?: string; js?: string }) => {
       const meta = await adaptations.saveEdit(host, edit)
-      reapplyIfCurrent(host)
-      void emitNavState()
+      reapplyForHost(host)
+      void emitTabs()
       return meta
     }
   )
   ipcMain.handle(IPC.setEditEnabled, async (_e, host: string, id: string, enabled: boolean) => {
     await adaptations.setEnabled(host, id, enabled)
-    reapplyIfCurrent(host)
-    void emitNavState()
+    reapplyForHost(host)
+    void emitTabs()
   })
   ipcMain.handle(IPC.deleteEdit, async (_e, host: string, id: string) => {
     await adaptations.deleteEdit(host, id)
-    reapplyIfCurrent(host)
-    void emitNavState()
+    await bubbles.forgetEdit(host, id)
+    await refreshBubbles()
+    reapplyForHost(host)
+    void emitTabs()
   })
   ipcMain.handle(IPC.publishHost, async (_e, host: string) => {
     try {
@@ -470,6 +566,47 @@ function wireIpc(): void {
       logger.log('error', 'publish.tampermonkey.error', { host, err: String((err as any)?.message ?? err) })
       throw err
     }
+  })
+
+  // ---- Bubbles ----
+  ipcMain.handle(IPC.listBubbles, () => bubbles.list())
+  ipcMain.handle(
+    IPC.saveBubble,
+    async (_e, input: { id?: string; name: string; hosts: string[] }) => {
+      const added = await bubbles.hostsAddedBy(input.id, input.hosts)
+      if (added.length && !(await askBubbleConsent(input.id, input.name, added))) {
+        return { ok: false, error: 'Declined' }
+      }
+      const b = await bubbles.save(input)
+      await refreshBubbles()
+      // Membership changes what gets injected, so re-run every member page.
+      for (const h of b.hosts) reapplyForHost(h)
+      logger.log('info', 'bubble.save', { id: b.id, hosts: b.hosts })
+      return { ok: true, bubble: b }
+    }
+  )
+  ipcMain.handle(IPC.deleteBubble, async (_e, id: string) => {
+    const b = await bubbles.get(id)
+    await bubbles.remove(id)
+    await refreshBubbles()
+    for (const h of b?.hosts ?? []) reapplyForHost(h)
+    logger.log('info', 'bubble.delete', { id })
+    return { ok: true }
+  })
+  // Move one edit into a bubble, or out of every bubble when bubbleId is null.
+  ipcMain.handle(
+    IPC.setEditBubble,
+    async (_e, host: string, editId: string, bubbleId: string | null) => {
+      await bubbles.forgetEdit(host, editId)
+      if (bubbleId) await bubbles.addEdit(bubbleId, { host, editId })
+      await refreshBubbles()
+      reapplyForHost(host)
+      return { ok: true }
+    }
+  )
+  ipcMain.handle(IPC.bubbleConsentResponse, (_e, requestId: string, allow: boolean) => {
+    pendingConsents.get(requestId)?.(allow)
+    pendingConsents.delete(requestId)
   })
 
   // ---- Scaffolded tools (global + per-site) ----
@@ -579,20 +716,96 @@ app.whenReady().then(async () => {
   // Start the page-tools MCP server before the agent so the first session gets it.
   try {
     pageTools = await startPageToolsServer({
-      inspector: pageInspector,
+      resolveInspector: (ref) => tabs.resolve(ref)?.inspector,
       workspace: WORKSPACE,
       adaptations,
-      currentUrl: () => contentView?.webContents.getURL() ?? '',
+      currentUrl: (ref) => {
+        const t = tabs.resolve(ref)
+        return t ? tabs.urlOf(t) : ''
+      },
+      listTabs: () => tabs.list().map((t) => ({ id: t.id, url: tabs.urlOf(t), title: t.view.webContents.isDestroyed() ? '' : t.view.webContents.getTitle(), host: tabs.hostOf(t) ?? '', hidden: t.hidden, active: t.id === tabs.activeId })),
+      openTab: (url, opts) => tabs.create({ url, background: opts?.background, hidden: opts?.hidden }).id,
+      closeTab: (ref) => { const t = tabs.resolve(ref); return t ? tabs.close(t.id) : false },
+      focusTab: (ref) => { const t = tabs.resolve(ref); return t ? tabs.focus(t.id) : false },
       reloadCurrent,
+      reloadHost,
+      bubbles,
+      saveBubble: async (input) => {
+        const added = await bubbles.hostsAddedBy(input.id, input.hosts)
+        if (added.length && !(await askBubbleConsent(input.id, input.name, added))) {
+          return { ok: false as const, error: 'the user declined' }
+        }
+        try {
+          const b = await bubbles.save(input)
+          await refreshBubbles()
+          for (const h of b.hosts) reapplyForHost(h)
+          return { ok: true as const, id: b.id }
+        } catch (err) {
+          return { ok: false as const, error: String((err as Error)?.message ?? err) }
+        }
+      },
+      setEditBubble: async (host, editId, bubbleId) => {
+        await bubbles.forgetEdit(host, editId)
+        if (bubbleId) await bubbles.addEdit(bubbleId, { host, editId })
+        await refreshBubbles()
+      },
       log: (l, e, d) => logger.log(l, e, d)
     })
   } catch (err) {
     logger.log('error', 'mcp.server.failed', String((err as any)?.message ?? err))
   }
+  // The bubble server: the localhost endpoint bubble-member edits talk to with
+  // plain fetch/EventSource. Deliberately NOT a preload — page JS already has a
+  // channel to localhost, so this adds no reach from a page toward Node.
+  try {
+    bubbleServer = await startBubbleServer({
+      workspace: WORKSPACE,
+      bubbles,
+      log: (l, e, d) => logger.log(l, e, d)
+    })
+    await refreshBubbles()
+    // Locked-down portals often send `connect-src 'self'`, which would refuse the
+    // bubble server outright. Widen that ONE directive, for bubble hosts only.
+    installCspRelaxation({
+      session: session.defaultSession,
+      endpoint: bubbleServer.url,
+      isBubbleHost: (h) => bubbleHosts.has(h),
+      log: (l, e, d) => logger.log(l, e, d)
+    })
+    await fsp.mkdir(join(WORKSPACE, '.malleable'), { recursive: true })
+    await fsp.writeFile(
+      join(WORKSPACE, '.malleable', 'bubbles.json'),
+      JSON.stringify(
+        {
+          endpoint: bubbleServer.url,
+          token: bubbleServer.token,
+          note:
+            'Bubble server for cross-site edits. Authorization is the Origin header ' +
+            '(browser-set, unforgeable from page JS): a request is served only if its ' +
+            "origin's host is a member of the bubble it names, so bubble membership IS " +
+            'the CORS allowlist. The bearer token additionally keeps non-browser local ' +
+            'processes out. GET /state?bubble=<id> · PUT /state?bubble=<id>&key=<k> · ' +
+            'POST /publish?bubble=<id>&ch=<c> · GET /watch?bubble=<id>&token=<t> (SSE). ' +
+            'State persists in .malleable/surface/<bubbleId>.json. Membership lives in ' +
+            'bubbles/<id>.json — a host may be in many bubbles, an edit in exactly one.'
+        },
+        null,
+        2
+      ),
+      'utf8'
+    )
+  } catch (err) {
+    logger.log('error', 'bubble.server.failed', String((err as any)?.message ?? err))
+  }
+
   // Raw CDP escape hatch for automation beyond the built-in MCP tools — see
   // cdp-bridge.ts. Published as a plain workspace fact, not a tool call.
   try {
-    cdpBridge = await startCdpBridge(() => contentView?.webContents)
+    cdpBridge = await startCdpBridge((ref) => {
+      const t = tabs.resolve(ref)
+      const wc = t?.view.webContents
+      return t && wc && !wc.isDestroyed() ? { id: t.id, wc } : undefined
+    })
     await fsp.mkdir(join(WORKSPACE, '.malleable'), { recursive: true })
     await fsp.writeFile(
       join(WORKSPACE, '.malleable', 'cdp.json'),
@@ -601,11 +814,13 @@ app.whenReady().then(async () => {
           wsUrl: cdpBridge.url,
           allowedDomains: cdpBridge.allowedDomains,
           note:
-            'Raw CDP session for the live page only (single target — Target/Browser domains are rejected, ' +
-            'as are Storage/Emulation/Security/Fetch). Connect with any CDP-speaking approach (a small ws + ' +
-            'JSON-RPC script, chrome-remote-interface in target-scoped mode) for automation the built-in MCP ' +
-            'tools (dom_query, run_js, ...) do not cover. See live/<host>/{network,console}.jsonl for ' +
-            'grep/tail-able page history.'
+            'Raw CDP relay for content tabs. Append &tab=<tabId|host> to pin a connection to one tab ' +
+            '(omitted = the active tab); the choice is made at connect time and cannot be changed in-band, ' +
+            'so a session still cannot pivot — Target/Browser are rejected, as are Storage/Emulation/' +
+            'Security/Fetch. Events carry a tabId field. Use list_tabs to see what is open. Connect with ' +
+            'any CDP-speaking approach (a small ws + JSON-RPC script, chrome-remote-interface in ' +
+            'target-scoped mode) for automation the built-in MCP tools (dom_query, run_js, ...) do not ' +
+            'cover. See live/<host>/{network,console}.jsonl for grep/tail-able page history.'
         },
         null,
         2
@@ -631,6 +846,7 @@ app.on('before-quit', () => {
   acp?.stop()
   pageTools?.close()
   cdpBridge?.close()
+  bubbleServer?.close()
   logger.close()
 })
 

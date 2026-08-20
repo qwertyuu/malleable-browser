@@ -1,0 +1,187 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Acme Tracker — Timesheet</title>
+<!--
+  MOCK SOURCE SYSTEM for the cross-tab timesheet scenario.
+
+  Deliberately unlike portal.html: ISO dates, full project NAMES, decimal hours,
+  and the whole week visible at once. The point of the pair is that an extract/fill
+  edit has to normalize between two vocabularies, not copy fields across.
+-->
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         margin: 0; background: #f5f6f8; color: #1d2129; }
+  header { background: #17324d; color: #fff; padding: 14px 22px; display: flex;
+           align-items: baseline; gap: 12px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+  header .who { font-size: 12px; opacity: .75; margin-left: auto; }
+  main { max-width: 880px; margin: 22px auto; padding: 0 18px; }
+  .week { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .week strong { font-size: 15px; }
+  table { width: 100%; border-collapse: collapse; background: #fff;
+          box-shadow: 0 1px 3px #0000001a; border-radius: 6px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #e6e8eb; }
+  th { background: #fafbfc; font-size: 11px; text-transform: uppercase;
+       letter-spacing: .06em; color: #5c6b7a; }
+  tbody tr:last-child td { border-bottom: none; }
+  input, select { font: inherit; padding: 4px 6px; border: 1px solid #d0d5da;
+                  border-radius: 4px; background: #fff; width: 100%; }
+  td.hours { width: 90px; }
+  td.date { width: 140px; }
+  td.project { width: 220px; }
+  td.actions { width: 40px; }
+  .rm { border: none; background: transparent; color: #a0a8b0; cursor: pointer;
+        font-size: 16px; padding: 0 4px; width: auto; }
+  .rm:hover { color: #c0392b; }
+  .bar { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+  button.primary { font: inherit; background: #17324d; color: #fff; border: none;
+                   padding: 7px 14px; border-radius: 5px; cursor: pointer; }
+  button.ghost { font: inherit; background: #fff; border: 1px solid #d0d5da;
+                 padding: 7px 14px; border-radius: 5px; cursor: pointer; }
+  .total { margin-left: auto; font-weight: 600; }
+  .hint { color: #6b7684; font-size: 12px; margin-top: 26px; }
+  code { background: #e8eaed; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+</style>
+
+<header>
+  <h1>Acme Tracker</h1>
+  <span>Timesheets</span>
+  <span class="who">rcote@acme.example</span>
+</header>
+
+<main>
+  <div class="week">
+    <strong>Week of <span id="week-of">—</span></strong>
+    <span id="week-id" data-week="" style="color:#6b7684;font-size:12px"></span>
+  </div>
+
+  <table id="timesheet">
+    <thead>
+      <tr>
+        <th>Date</th><th>Project</th><th>Hours</th><th>Description</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div class="bar">
+    <button class="ghost" id="add">+ Add row</button>
+    <button class="primary" id="save">Save timesheet</button>
+    <span class="total">Total: <span id="total">0</span> h</span>
+  </div>
+
+  <p class="hint">
+    Mock source system. Rows persist in <code>localStorage</code> under
+    <code>acme.timesheet</code>. Each row carries
+    <code>data-date</code>, <code>data-project</code>, <code>data-hours</code> and
+    <code>data-note</code> so an extract edit has something stable to read.
+  </p>
+</main>
+
+<script>
+  const PROJECTS = ['Website Redesign', 'Mobile App', 'Internal Tools', 'Client Support']
+  const KEY = 'acme.timesheet'
+
+  /** Monday of the current week, ISO. The portal keys entries by the same week. */
+  function mondayOf(d) {
+    const x = new Date(d)
+    x.setHours(0, 0, 0, 0)
+    x.setDate(x.getDate() - ((x.getDay() + 6) % 7))
+    return x
+  }
+  const iso = (d) => d.toISOString().slice(0, 10)
+
+  const monday = mondayOf(new Date())
+  const weekId = iso(monday)
+  document.getElementById('week-of').textContent = monday.toLocaleDateString(undefined, {
+    month: 'long', day: 'numeric', year: 'numeric'
+  })
+  const weekEl = document.getElementById('week-id')
+  weekEl.dataset.week = weekId
+  weekEl.textContent = '(' + weekId + ')'
+
+  const seed = () =>
+    [0, 1, 2].map((i) => ({
+      date: iso(new Date(monday.getTime() + i * 864e5)),
+      project: PROJECTS[i % PROJECTS.length],
+      hours: [7.5, 8, 6.25][i],
+      note: ['Nav + header rebuild', 'Offline sync spike', 'Build script cleanup'][i]
+    }))
+
+  function load() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(KEY) || 'null')
+      if (raw && raw.week === weekId && Array.isArray(raw.rows)) return raw.rows
+    } catch {}
+    return seed()
+  }
+
+  let rows = load()
+
+  function render() {
+    const tb = document.getElementById('rows')
+    tb.textContent = ''
+    rows.forEach((r, i) => {
+      const tr = document.createElement('tr')
+      tr.className = 'entry'
+      // Mirrored onto data-* so an extract edit can read normalized values
+      // without reverse-engineering the inputs.
+      tr.dataset.date = r.date
+      tr.dataset.project = r.project
+      tr.dataset.hours = String(r.hours)
+      tr.dataset.note = r.note
+
+      const td = (cls, child) => {
+        const c = document.createElement('td')
+        c.className = cls
+        c.appendChild(child)
+        return c
+      }
+      const mk = (tag, props) => Object.assign(document.createElement(tag), props)
+
+      const date = mk('input', { type: 'date', value: r.date, className: 'f-date' })
+      const proj = mk('select', { className: 'f-project' })
+      PROJECTS.forEach((p) => proj.appendChild(mk('option', { value: p, textContent: p })))
+      proj.value = r.project
+      const hours = mk('input', { type: 'number', step: '0.25', min: '0', value: String(r.hours), className: 'f-hours' })
+      const note = mk('input', { type: 'text', value: r.note, className: 'f-note' })
+      const rm = mk('button', { className: 'rm', textContent: '×', title: 'Remove row' })
+
+      ;[[date, 'date'], [proj, 'project'], [hours, 'hours'], [note, 'note']].forEach(([el, k]) => {
+        el.addEventListener('input', () => {
+          rows[i][k] = k === 'hours' ? Number(el.value) : el.value
+          tr.dataset[k] = String(rows[i][k])
+          retotal()
+        })
+      })
+      rm.addEventListener('click', () => { rows.splice(i, 1); render() })
+
+      tr.append(td('date', date), td('project', proj), td('hours', hours), td('', note), td('actions', rm))
+      tb.appendChild(tr)
+    })
+    retotal()
+  }
+
+  function retotal() {
+    const t = rows.reduce((a, r) => a + (Number(r.hours) || 0), 0)
+    document.getElementById('total').textContent = String(Math.round(t * 100) / 100)
+  }
+
+  document.getElementById('add').addEventListener('click', () => {
+    rows.push({ date: weekId, project: PROJECTS[0], hours: 0, note: '' })
+    render()
+  })
+
+  document.getElementById('save').addEventListener('click', () => {
+    localStorage.setItem(KEY, JSON.stringify({ week: weekId, rows }))
+    // A real event an adaptation can hook, instead of polling the DOM.
+    document.dispatchEvent(new CustomEvent('timesheet:saved', { detail: { week: weekId, rows } }))
+    const b = document.getElementById('save')
+    b.textContent = 'Saved ✓'
+    setTimeout(() => (b.textContent = 'Save timesheet'), 1200)
+  })
+
+  render()
+</script>

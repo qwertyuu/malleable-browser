@@ -3,7 +3,9 @@ import {
   IPC,
   EVT,
   type Rect,
-  type NavState,
+  type TabsState,
+  type Bubble,
+  type BubbleConsentRequest,
   type AdaptResult,
   type AcpStatus,
   type PermissionRequestDTO,
@@ -24,16 +26,23 @@ import {
 
 /** Minimal, explicit surface exposed to the trusted chrome renderer. */
 const api = {
-  // Browsing (embedded WebContentsView).
-  navigate: (url: string): Promise<void> => ipcRenderer.invoke(IPC.navigate, url),
-  goBack: (): Promise<void> => ipcRenderer.invoke(IPC.goBack),
-  goForward: (): Promise<void> => ipcRenderer.invoke(IPC.goForward),
-  reload: (): Promise<void> => ipcRenderer.invoke(IPC.reload),
+  // Browsing. `tabId` is optional everywhere — omitted means the active tab.
+  navigate: (url: string, tabId?: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.navigate, url, tabId),
+  goBack: (tabId?: string): Promise<void> => ipcRenderer.invoke(IPC.goBack, tabId),
+  goForward: (tabId?: string): Promise<void> => ipcRenderer.invoke(IPC.goForward, tabId),
+  reload: (tabId?: string): Promise<void> => ipcRenderer.invoke(IPC.reload, tabId),
   setContentBounds: (r: Rect): Promise<void> => ipcRenderer.invoke(IPC.setContentBounds, r),
-  onNavState: (cb: (s: NavState) => void) => subscribe(EVT.navState, cb),
-  setSafeMode: (enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> =>
-    ipcRenderer.invoke(IPC.setSafeMode, enabled),
-  clearSiteData: (): Promise<{ ok: boolean }> => ipcRenderer.invoke(IPC.clearSiteData),
+  setSafeMode: (enabled: boolean, tabId?: string): Promise<{ ok: boolean; enabled: boolean }> =>
+    ipcRenderer.invoke(IPC.setSafeMode, enabled, tabId),
+  clearSiteData: (tabId?: string): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke(IPC.clearSiteData, tabId),
+
+  // Tabs.
+  newTab: (url?: string): Promise<void> => ipcRenderer.invoke(IPC.newTab, url),
+  closeTab: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.closeTab, tabId),
+  focusTab: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.focusTab, tabId),
+  onTabsState: (cb: (s: TabsState) => void) => subscribe(EVT.tabsState, cb),
 
   // Malleability loop. Prompts target an explicit session so a mid-turn thread
   // switch can never misroute the turn.
@@ -63,7 +72,7 @@ const api = {
     ipcRenderer.invoke(IPC.setAgentCommand, agentCommand),
 
   // Per-site content adaptations + library.
-  resetSite: (): Promise<{ ok: boolean }> => ipcRenderer.invoke(IPC.resetSite),
+  resetSite: (host?: string): Promise<{ ok: boolean }> => ipcRenderer.invoke(IPC.resetSite, host),
   listAdaptations: (): Promise<HostAdaptations[]> => ipcRenderer.invoke(IPC.listAdaptations),
   getEdit: (host: string, id: string): Promise<EditContent | null> =>
     ipcRenderer.invoke(IPC.getEdit, host, id),
@@ -93,6 +102,23 @@ const api = {
     ipcRenderer.invoke(IPC.permissionResponse, requestId, optionId),
 
   // Checkpoints / revert.
+  // Bubbles: groups of sites whose edits may exchange data with each other.
+  listBubbles: (): Promise<Bubble[]> => ipcRenderer.invoke(IPC.listBubbles),
+  saveBubble: (input: {
+    id?: string
+    name: string
+    hosts: string[]
+  }): Promise<{ ok: boolean; bubble?: Bubble; error?: string }> =>
+    ipcRenderer.invoke(IPC.saveBubble, input),
+  deleteBubble: (id: string): Promise<{ ok: boolean }> => ipcRenderer.invoke(IPC.deleteBubble, id),
+  setEditBubble: (host: string, editId: string, bubbleId: string | null): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke(IPC.setEditBubble, host, editId, bubbleId),
+  respondBubbleConsent: (requestId: string, allow: boolean): Promise<void> =>
+    ipcRenderer.invoke(IPC.bubbleConsentResponse, requestId, allow),
+  onBubbles: (cb: (list: Bubble[]) => void) => subscribe(EVT.bubbles, cb),
+  onBubbleConsentRequest: (cb: (r: BubbleConsentRequest) => void) =>
+    subscribe(EVT.bubbleConsentRequest, cb),
+
   revertLast: (): Promise<CheckpointInfo | null> => ipcRenderer.invoke(IPC.revertLast),
   listCheckpoints: (): Promise<CheckpointInfo[]> => ipcRenderer.invoke(IPC.listCheckpoints),
 

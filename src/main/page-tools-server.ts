@@ -7,18 +7,50 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import type { PageInspector } from './page-inspector.js'
 import type { Adaptations } from './adaptations.js'
+import type { Bubbles } from './bubbles.js'
 import { DynamicTools, type DynamicToolDef, type ParamSpec } from './dynamic-tools.js'
 
 type Log = (level: 'debug' | 'info' | 'warn' | 'error', event: string, data?: unknown) => void
 
+/** One open tab, as the agent sees it via list_tabs. */
+export interface TabSummary {
+  id: string
+  url: string
+  title: string
+  host: string
+  hidden: boolean
+  active: boolean
+}
+
 export interface PageToolsDeps {
-  inspector: PageInspector
   workspace: string
   adaptations: Adaptations
-  /** URL of the page currently shown, for host resolution. */
-  currentUrl: () => string
-  /** Reload the visible page and wait for load (so injected edits are visible). */
-  reloadCurrent: () => Promise<void>
+  /**
+   * Resolve a tab reference to its inspector. `ref` is a tab id, a host, or a
+   * URL/title substring; undefined means the active tab. Every live page tool
+   * goes through this, which is what makes them tab-addressable.
+   */
+  resolveInspector: (ref?: string) => PageInspector | undefined
+  /** URL of a tab (default: the active one), for host resolution. */
+  currentUrl: (ref?: string) => string
+  /** Reload a tab and wait for load (so injected edits are visible). */
+  reloadCurrent: (ref?: string) => Promise<void>
+  /** Reload every tab showing this host and wait — after an edit changes. */
+  reloadHost: (host: string) => Promise<void>
+  bubbles: Bubbles
+  /**
+   * Create/extend a bubble. Resolves false if the user declined the consent
+   * prompt, which is the ONE gate in the bubble model.
+   */
+  saveBubble: (input: { id?: string; name: string; hosts: string[] }) => Promise<
+    { ok: true; id: string } | { ok: false; error: string }
+  >
+  /** Move an edit into a bubble, or out of all of them when null. */
+  setEditBubble: (host: string, editId: string, bubbleId: string | null) => Promise<void>
+  listTabs: () => TabSummary[]
+  openTab: (url: string, opts?: { background?: boolean; hidden?: boolean }) => string
+  closeTab: (ref?: string) => boolean
+  focusTab: (ref?: string) => boolean
   log: Log
 }
 
@@ -36,19 +68,34 @@ const jsonResult = (data: unknown) => ({
   content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }]
 })
 
-/** Register one agent-authored tool (runs as page-JS) on a live server. */
+/**
+ * Register one agent-authored tool (runs as page-JS) on a live server.
+ *
+ * Every dynamic tool gets a reserved `tab` param (unless the author already
+ * declared one). A site-scoped tool defaults to a tab showing ITS host rather
+ * than whatever is focused — it was scaffolded as a harness for that site, so
+ * running it against an unrelated page would just fail confusingly.
+ */
 function registerDynamic(
   server: McpServer,
   def: DynamicToolDef,
-  inspector: PageInspector,
+  resolveInspector: (ref?: string) => PageInspector | undefined,
   log: Log
 ): RegisteredTool {
+  const shape = DynamicTools.toZodShape(def.inputSchema)
+  if (!('tab' in shape)) {
+    shape.tab = z.string().optional().describe('tab id or host (default: this tool\'s site, else active tab)')
+  }
   return server.registerTool(
     def.name,
-    { description: def.description, inputSchema: DynamicTools.toZodShape(def.inputSchema) },
+    { description: def.description, inputSchema: shape },
     async (args: Record<string, unknown>) => {
-      log('info', 'tool.dynamic', { name: def.name, args })
-      return jsonResult(await inspector.runJsWithArgs(def.code, args))
+      const { tab, ...rest } = args as { tab?: string } & Record<string, unknown>
+      log('info', 'tool.dynamic', { name: def.name, tab, args: rest })
+      const ref = tab ?? (def.scope === 'site' ? def.host : undefined)
+      const inspector = resolveInspector(ref) ?? resolveInspector()
+      if (!inspector) throw new Error('No tab available to run this tool in')
+      return jsonResult(await inspector.runJsWithArgs(def.code, rest))
     }
   )
 }
@@ -66,13 +113,26 @@ interface BuiltServer {
 }
 
 async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<BuiltServer> {
-  const { inspector, adaptations, currentUrl, reloadCurrent, log } = deps
+  const { adaptations, resolveInspector, currentUrl, reloadCurrent, reloadHost, log } = deps
+  const { listTabs, openTab, closeTab, focusTab } = deps
+  const { bubbles, saveBubble, setEditBubble } = deps
   const server = new McpServer({ name: 'malleable-page', version: '0.1.0' })
   // name -> live registration. Global tools are always present; site tools track
   // the current host and are swapped as you navigate.
   const registered = new Map<string, RegisteredTool>()
   const siteRegistered = new Map<string, RegisteredTool>()
   let currentSiteHost: string | null = null
+
+  /**
+   * The inspector for a tab reference, or a clear error. `tab` is optional on
+   * every live page tool, so the default (active tab) preserves the pre-tabs
+   * behaviour of every existing call.
+   */
+  const insp = (tab?: string): PageInspector => {
+    const i = resolveInspector(tab)
+    if (!i) throw new Error(tab ? `No tab matches "${tab}" — use list_tabs to see what's open` : 'No page loaded')
+    return i
+  }
 
   const hostNow = (): string | null => adaptations.slugFor(currentUrl())
 
@@ -82,7 +142,6 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
     if (!h) throw new Error('No host: load a page or pass an explicit host')
     return h
   }
-  const isCurrent = (host: string): boolean => hostNow() === host
 
   // Swap the site-scoped tool set to `host`, firing tools/list_changed if it changed.
   const reconcileSiteTools = async (host: string | null): Promise<void> => {
@@ -92,7 +151,7 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
     if (host) {
       for (const def of await dynamic.listSite(host)) {
         try {
-          siteRegistered.set(def.name, registerDynamic(server, def, inspector, log))
+          siteRegistered.set(def.name, registerDynamic(server, def, resolveInspector, log))
         } catch (err) {
           log('warn', 'tool.load.error', { name: def.name, err: String((err as any)?.message ?? err) })
         }
@@ -117,7 +176,7 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
     }
     for (const [name, def] of disk) {
       if (!registered.has(name)) {
-        registered.set(name, registerDynamic(server, def, inspector, log))
+        registered.set(name, registerDynamic(server, def, resolveInspector, log))
         changed = true
       }
     }
@@ -137,24 +196,34 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
       inputSchema: {
         selector: z.string(),
         all: z.boolean().optional(),
-        limit: z.number().optional()
+        limit: z.number().optional(),
+        tab: z.string().optional().describe('tab id or host (default: the active tab)')
       }
     },
-    async ({ selector, all, limit }) =>
-      jsonResult(await inspector.domQuery(selector, all ?? false, limit ?? 10))
+    async ({ selector, all, limit, tab }) =>
+      jsonResult(await insp(tab).domQuery(selector, all ?? false, limit ?? 10))
   )
   server.registerTool(
     'run_js',
     {
       description: 'Run JS in the live page and return the result (use `return`).',
-      inputSchema: { code: z.string() }
+      inputSchema: {
+        code: z.string(),
+        tab: z.string().optional().describe('tab id or host (default: the active tab)')
+      }
     },
-    async ({ code }) => jsonResult(await inspector.runJs(code))
+    async ({ code, tab }) => jsonResult(await insp(tab).runJs(code))
   )
   server.registerTool(
     'get_console',
-    { description: 'Recent page console messages.', inputSchema: { limit: z.number().optional() } },
-    async ({ limit }) => jsonResult(inspector.getConsole(limit ?? 50))
+    {
+      description: 'Recent page console messages.',
+      inputSchema: {
+        limit: z.number().optional(),
+        tab: z.string().optional().describe('tab id or host (default: the active tab)')
+      }
+    },
+    async ({ limit, tab }) => jsonResult(insp(tab).getConsole(limit ?? 50))
   )
   server.registerTool(
     'get_network',
@@ -169,17 +238,26 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
         urlContains: z.string().optional(),
         type: z.string().optional(),
         method: z.string().optional(),
-        status: z.number().optional()
+        status: z.number().optional(),
+        tab: z.string().optional().describe('tab id or host (default: the active tab)')
       }
     },
-    async ({ limit, urlContains, type, method, status }) =>
-      jsonResult(inspector.getNetwork(limit ?? 50, { urlContains, type, method, status }))
+    async ({ limit, urlContains, type, method, status, tab }) =>
+      jsonResult(insp(tab).getNetwork(limit ?? 50, { urlContains, type, method, status }))
   )
   server.registerTool(
     'screenshot',
-    { description: 'PNG screenshot of the page so you can SEE it.', inputSchema: {} },
-    async () => ({
-      content: [{ type: 'image' as const, data: await inspector.screenshot(), mimeType: 'image/png' }]
+    {
+      description:
+        'PNG screenshot of the page so you can SEE it. Most reliable on the focused ' +
+        'tab: a background tab may not be producing frames, so if the image comes ' +
+        'back blank, focus_tab first and retry.',
+      inputSchema: {
+        tab: z.string().optional().describe('tab id or host (default: the active tab)')
+      }
+    },
+    async ({ tab }) => ({
+      content: [{ type: 'image' as const, data: await insp(tab).screenshot(), mimeType: 'image/png' }]
     })
   )
   server.registerTool(
@@ -187,11 +265,121 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
     { description: 'Download an image by URL and view it (multimodal).', inputSchema: { url: z.string() } },
     async ({ url }) => {
       try {
-        const { data, mimeType } = await inspector.fetchImage(url)
+        const { data, mimeType } = await insp().fetchImage(url)
         return { content: [{ type: 'image' as const, data, mimeType }] }
       } catch (err) {
         return { isError: true, content: [{ type: 'text' as const, text: String((err as any)?.message ?? err) }] }
       }
+    }
+  )
+
+  // ---- Tabs ----
+  // Everything above takes an optional `tab`; these let the agent see and shape
+  // what there is to target. Refs are resolved leniently (id, host, substring),
+  // because the agent reasons about sites, not ids.
+  server.registerTool(
+    'list_tabs',
+    {
+      description:
+        'List open tabs (id, url, title, host, which is active). Every page tool takes a `tab` ref ' +
+        'matching a tab id or host, so start here when working across sites.',
+      inputSchema: {}
+    },
+    async () => jsonResult(listTabs())
+  )
+  server.registerTool(
+    'open_tab',
+    {
+      description: 'Open a URL in a new tab and return its tab id.',
+      inputSchema: {
+        url: z.string(),
+        background: z.boolean().optional().describe('open without stealing focus (default: false)')
+      }
+    },
+    async ({ url, background }) => {
+      const id = openTab(url, { background })
+      log('info', 'tool.open_tab', { url, id, background: background ?? false })
+      return jsonResult({ ok: true, tab: id, url })
+    }
+  )
+  server.registerTool(
+    'close_tab',
+    {
+      description: 'Close a tab by id or host.',
+      inputSchema: { tab: z.string().describe('tab id or host') }
+    },
+    async ({ tab }) => jsonResult({ ok: closeTab(tab) })
+  )
+  server.registerTool(
+    'focus_tab',
+    {
+      description:
+        'Bring a tab to the front. Not needed just to inspect or screenshot it — ' +
+        'every page tool works on background tabs.',
+      inputSchema: { tab: z.string().describe('tab id or host') }
+    },
+    async ({ tab }) => jsonResult({ ok: focusTab(tab) })
+  )
+
+  // ---- Bubbles: cross-site data exchange ----
+  server.registerTool(
+    'list_bubbles',
+    {
+      description:
+        'List bubbles: named groups of sites whose edits may exchange data with each ' +
+        'other and nothing outside. Shows each bubble\'s sites and member edits.',
+      inputSchema: {}
+    },
+    async () => jsonResult(await bubbles.list())
+  )
+  server.registerTool(
+    'save_bubble',
+    {
+      description:
+        'Create a bubble (or add sites to one). Adding sites asks the USER to confirm — ' +
+        'the single consent point in the model, so it is not automatic. Once approved, ' +
+        'edits you put in the bubble can exchange data across those sites with no ' +
+        'further prompting. Use this BEFORE writing cross-site edits.',
+      inputSchema: {
+        name: z.string().describe('short human name, e.g. "Timesheets"'),
+        hosts: z.array(z.string()).describe('hostnames that may exchange data'),
+        id: z.string().optional().describe('existing bubble id, to extend it')
+      }
+    },
+    async ({ name, hosts, id }) => {
+      const res = await saveBubble({ id, name, hosts })
+      if (!res.ok) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `Bubble not saved: ${res.error}. The user must approve the sites before edits can share data.`
+            }
+          ]
+        }
+      }
+      return jsonResult({ ok: true, bubble: res.id })
+    }
+  )
+  server.registerTool(
+    'set_edit_bubble',
+    {
+      description:
+        'Put an edit INTO a bubble (or pass bubble:null to take it out). An edit gets ' +
+        'its `mal` handle only once it is in a bubble. An edit belongs to exactly one ' +
+        'bubble; to share logic across two features, write two edits.',
+      inputSchema: {
+        id: z.string().describe('edit id'),
+        bubble: z.string().nullable().describe('bubble id, or null to remove'),
+        host: z.string().optional().describe('defaults to the focused page')
+      }
+    },
+    async ({ id, bubble, host }) => {
+      const h = resolveHost(host)
+      await setEditBubble(h, id, bubble)
+      await reloadHost(h)
+      return jsonResult({ ok: true, host: h, edit: id, bubble })
     }
   )
 
@@ -236,11 +424,11 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
           // Register live only if it's for the host currently on screen.
           if (host === currentSiteHost) {
             siteRegistered.get(name)?.remove()
-            siteRegistered.set(name, registerDynamic(server, def, inspector, log))
+            siteRegistered.set(name, registerDynamic(server, def, resolveInspector, log))
           }
         } else {
           registered.get(name)?.remove()
-          registered.set(name, registerDynamic(server, def, inspector, log))
+          registered.set(name, registerDynamic(server, def, resolveInspector, log))
         }
         server.sendToolListChanged()
         log('info', 'tool.define', { name, scope: def.scope, host })
@@ -328,7 +516,7 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
         const h = resolveHost(host)
         const meta = await adaptations.saveEdit(h, { id, name, kind, css, js })
         log('info', 'adaptation.save', { host: h, id: meta.id, name, kind: meta.kind })
-        if (isCurrent(h)) await reloadCurrent()
+        await reloadHost(h)
         return jsonResult({ ok: true, host: h, ...meta })
       } catch (err) {
         return { isError: true, content: [{ type: 'text' as const, text: String((err as any)?.message ?? err) }] }
@@ -361,7 +549,7 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
       const h = resolveHost(host)
       await adaptations.setEnabled(h, id, enabled)
       log('info', 'adaptation.toggle', { host: h, id, enabled })
-      if (isCurrent(h)) await reloadCurrent()
+      await reloadHost(h)
       return jsonResult({ ok: true, id, enabled })
     }
   )
@@ -375,7 +563,7 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
       const h = resolveHost(host)
       await adaptations.deleteEdit(h, id)
       log('info', 'adaptation.delete', { host: h, id })
-      if (isCurrent(h)) await reloadCurrent()
+      await reloadHost(h)
       return jsonResult({ ok: true, deleted: id })
     }
   )
@@ -384,7 +572,7 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
   // Global tools are always registered; site tools track the current host.
   for (const def of await dynamic.listGlobal()) {
     try {
-      registered.set(def.name, registerDynamic(server, def, inspector, log))
+      registered.set(def.name, registerDynamic(server, def, resolveInspector, log))
     } catch (err) {
       log('warn', 'tool.load.error', { name: def.name, err: String((err as any)?.message ?? err) })
     }
