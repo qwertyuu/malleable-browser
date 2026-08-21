@@ -5,6 +5,7 @@ import {
   type Rect,
   type TabsState,
   type Bubble,
+  type BubblePushResult,
   type BubbleConsentRequest,
   type AdaptResult,
   type AcpStatus,
@@ -113,6 +114,12 @@ const api = {
   deleteBubble: (id: string): Promise<{ ok: boolean }> => ipcRenderer.invoke(IPC.deleteBubble, id),
   setEditBubble: (host: string, editId: string, bubbleId: string | null): Promise<{ ok: boolean }> =>
     ipcRenderer.invoke(IPC.setEditBubble, host, editId, bubbleId),
+  pushBubble: (
+    id: string,
+    opts?: { sourceHost?: string; hidden?: boolean }
+  ): Promise<BubblePushResult> => ipcRenderer.invoke(IPC.pushBubble, id, opts),
+  publishBubble: (id: string): Promise<PublishResult> =>
+    ipcRenderer.invoke(IPC.publishBubble, id),
   respondBubbleConsent: (requestId: string, allow: boolean): Promise<void> =>
     ipcRenderer.invoke(IPC.bubbleConsentResponse, requestId, allow),
   onBubbles: (cb: (list: Bubble[]) => void) => subscribe(EVT.bubbles, cb),

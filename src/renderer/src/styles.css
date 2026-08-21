@@ -1412,3 +1412,69 @@ details.row.plan {
 .consent-allow:hover {
   filter: brightness(1.1);
 }
+
+/* ---- Bubbles in the Library ---- */
+.bubble-row {
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  background: var(--field);
+  border: 1px solid var(--chrome-border);
+  border-radius: 6px;
+}
+
+.bubble-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bubble-hosts {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  /* Long host lists shouldn't push the actions off the row. */
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.bubble-meta {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 2px 0 6px;
+}
+
+.bubble-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.bubble-actions .danger {
+  color: var(--err);
+}
+
+.bubble-msg {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--chrome-border);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.bubble-msg.err {
+  color: var(--err);
+}
+
+.bubble-report {
+  margin-top: 6px;
+}
+
+.bubble-report strong {
+  display: block;
+  color: var(--warn);
+  font-weight: 600;
+  margin-bottom: 2px;
+}

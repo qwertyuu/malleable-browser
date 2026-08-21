@@ -94,7 +94,12 @@ function render() {
   btn.textContent = `Fill ${pending.length} ${pending.length === 1 ? 'entry' : 'entries'}`
 }
 
-btn.addEventListener('click', () => {
+/**
+ * Enter every row not already in the ledger. Idempotent by construction — it
+ * skips what's present — which matters because a push can repeat.
+ */
+function fillPending() {
+  if (!sheet || !sheet.rows?.length) return { entered: 0, failed: 0, message: 'nothing in the bubble' }
   const done = alreadyEntered()
   const pending = sheet.rows.filter((r) => !done.has(`${toUsDate(r.date)}|${CODE[r.project]}`))
   const failed = []
@@ -106,9 +111,18 @@ btn.addEventListener('click', () => {
   }
   out.textContent = `Entered ${ok}/${pending.length}.` + (failed.length ? ' ' + failed.join('; ') : '')
   render()
+  return { entered: ok, failed: failed.length, message: failed.join('; ') || undefined }
+}
+
+btn.addEventListener('click', () => {
+  const r = fillPending()
   // Let the rest of the bubble know this destination is done.
-  void mal.bus.publish('filled', { host: location.host, entered: ok, failed: failed.length })
+  void mal.bus.publish('filled', { host: location.hostname, entered: r.entered, failed: r.failed })
 })
+
+// Let push_bubble drive this site unattended. Same routine the button runs, so
+// there is exactly one fill path to get right.
+mal.onPush(() => fillPending())
 
 // Live: the panel updates the moment the tracker writes, with no reload.
 mal.state.watch('timesheet', (v) => {

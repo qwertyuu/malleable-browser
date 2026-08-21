@@ -1,7 +1,8 @@
 import { promises as fs } from 'node:fs'
 import { join } from 'node:path'
 import type { Adaptations } from './adaptations.js'
-import { collectEnabledBundle, wrapEditJs } from './edit-bundle.js'
+import { collectEnabledBundle, wrapEditJs, classifyEdit, TIER_REASON } from './edit-bundle.js'
+import type { Bubbles } from './bubbles.js'
 import type { PublishResult } from '../shared/ipc.js'
 
 /**
@@ -26,7 +27,8 @@ import type { PublishResult } from '../shared/ipc.js'
 export async function publishHostAsUserscript(
   adaptations: Adaptations,
   workspaceRoot: string,
-  host: string
+  host: string,
+  bubbles?: Bubbles
 ): Promise<PublishResult> {
   if (!/^[a-zA-Z0-9.-]+$/.test(host)) {
     return { ok: false, error: `Invalid host: ${host}.` }
@@ -36,7 +38,41 @@ export async function publishHostAsUserscript(
   if (!bundle) {
     return { ok: false, error: `No enabled edits with content for ${host}.` }
   }
-  const { css, jsEdits, names } = bundle
+
+  /**
+   * Cross-site edits are excluded, not degraded. A userscript has no background
+   * context to relay through, and this generator emits `@grant none`, so no GM_*
+   * value store exists either — there is nothing to build a fallback on. Export
+   * the bubble as an extension instead.
+   */
+  const excluded: NonNullable<PublishResult['report']>['excluded'] = []
+  const keptJs: typeof bundle.jsEdits = []
+  for (const e of bundle.jsEdits) {
+    const owner = bubbles ? await bubbles.bubbleForEdit(host, e.id) : null
+    const tier = classifyEdit(e.code, owner)
+    if (tier >= 1) {
+      excluded.push({
+        host,
+        name: e.name,
+        tier,
+        reason: `${TIER_REASON[tier]} — publish the "${owner?.name ?? 'bubble'}" bubble as an extension`
+      })
+      continue
+    }
+    keptJs.push(e)
+  }
+
+  if (!keptJs.length && !bundle.css.trim()) {
+    return {
+      ok: false,
+      error: `Every enabled edit for ${host} needs cross-site data, which a userscript can't do. Publish its bubble as an extension.`,
+      report: { included: [], excluded, caveats: [] }
+    }
+  }
+
+  const css = bundle.css
+  const jsEdits = keptJs
+  const names = keptJs.length ? keptJs.map((e) => e.name) : bundle.names
   // Header lines are plain text, not JSON — strip newlines so a stray one in
   // an edit's name can't inject a bogus extra @directive into the block.
   const safeNames = names.map((n) => n.replace(/[\r\n]/g, ' ')).join(', ')
@@ -77,5 +113,17 @@ export async function publishHostAsUserscript(
   const filePath = join(dir, `${host}.user.js`)
   await fs.writeFile(filePath, header + body, 'utf8')
 
-  return { ok: true, filePath }
+  return {
+    ok: true,
+    filePath,
+    report: {
+      included: bundle.names
+        .filter((n) => !excluded.some((x) => x.name === n))
+        .map((n) => ({ host, name: n, tier: 0 as const })),
+      excluded,
+      caveats: excluded.length
+        ? ['Cross-site edits were left out — a userscript has no background context to relay through.']
+        : []
+    }
+  }
 }

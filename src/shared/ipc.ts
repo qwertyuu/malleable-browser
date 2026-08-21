@@ -50,6 +50,8 @@ export const IPC = {
   saveBubble: 'bubble:save',
   deleteBubble: 'bubble:delete',
   setEditBubble: 'bubble:setEdit',
+  pushBubble: 'bubble:push',
+  publishBubble: 'bubble:publish',
   bubbleConsentResponse: 'bubble:consentResponse',
 
   // Agent-scaffolded tools (global + per-site).
@@ -153,6 +155,35 @@ export interface Bubble {
   edits: BubbleEditRef[]
   createdAt: number
   updatedAt: number
+}
+
+/**
+ * What an edit needs from its environment, and so where it can run.
+ * 0 = self-contained · 1 = bubble state/bus · 2 = drives tabs · 3 = Malleable only.
+ */
+export type EditTier = 0 | 1 | 2 | 3
+
+/** What made it into an export and what didn't — never a silent truncation. */
+export interface PublishReport {
+  included: { host: string; name: string; tier: EditTier }[]
+  excluded: { host: string; name: string; tier: EditTier; reason: string }[]
+  /** Capabilities the artifact approximates rather than reproduces exactly. */
+  caveats: string[]
+}
+
+/** Outcome of pushing a bubble's data to every destination site in it. */
+export interface BubblePushResult {
+  ok: boolean
+  /** Total entries the destinations reported creating. */
+  entered?: number
+  error?: string
+  results: {
+    host: string
+    ok: boolean
+    entered: number
+    failed: number
+    message?: string
+  }[]
 }
 
 /** Asked before a bubble gains sites — the one consent point in the model. */
@@ -298,6 +329,8 @@ export interface PublishResult {
   dir?: string
   /** Path to the generated .user.js (userscript export). */
   filePath?: string
+  /** What was included/excluded and why. Surfaced in the Library. */
+  report?: PublishReport
   error?: string
 }
 

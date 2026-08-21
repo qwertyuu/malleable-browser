@@ -91,6 +91,8 @@ src/
     bubble-server.ts        #   localhost endpoint edits reach via fetch/EventSource
     mal-shim.ts             #   the `mal` handle handed to a bubble-member edit
     csp.ts                  #   widen connect-src for bubble hosts only
+    bubble-push.ts          #   push-to-all orchestration (no cross-tab eval)
+    bubble-export.ts        #   MV3 codegen: mal over chrome.storage + a worker
     page-inspector.ts       #   DOM/JS/console/network/screenshot backing tools
     page-tools-server.ts    #   in-process MCP server exposing the agent's tools
     cdp-bridge.ts           #   scoped raw CDP-over-WebSocket relay for the page
@@ -185,6 +187,7 @@ Exposed by an in-process, **localhost-only, bearer-token-gated** MCP server
 | `set_adaptation_enabled` / `delete_adaptation` | Toggle / remove an edit |
 | `define_tool` / `list_tools` / `remove_tool` | Scaffold new tools at runtime |
 | `list_bubbles` / `save_bubble` / `set_edit_bubble` | Let sites share data (see Bubbles) |
+| `push_bubble` | Drive every destination site in a bubble in one action |
 
 Every live page tool takes an optional **`tab`** ref — a tab id, a host, or a
 URL/title substring; omitted means the focused tab. So `dom_query` and friends are
@@ -252,6 +255,61 @@ The honest limit: membership is granted to the **origin**, not to the specific
 edit. Any script on a member page — including the site's own — can reach that
 bubble's state. The bubble is the blast radius, which is why it should hold only
 the sites a feature actually needs.
+
+### Push to all
+
+A fill edit can also register to be driven unattended:
+
+```js
+mal.onPush(async () => { /* fill this site */ return { entered: n, failed: m } })
+```
+
+`push_bubble` (or **Push to all** in the Library) then opens or focuses a tab per
+destination and each site's **own** edit runs its routine and reports back.
+
+Note what this deliberately is *not*: cross-tab code execution. Letting a page ask
+main to run code in a sibling tab would be a far larger grant than data sharing —
+because authorization is per-origin, a member site's own scripts could use it to
+execute code in another member's page. So main writes a `__push` key instead, and
+each destination answers `__result:<host>`. Nothing runs code in anyone else's
+page, and the edit that knows a given form is the one that drives it.
+
+Fill routines should be idempotent (check what's already entered) since a push can
+repeat.
+
+### Exporting: what travels and what doesn't
+
+| Tier | Uses | Extension | Userscript |
+|------|------|-----------|------------|
+| 0 | CSS / self-contained JS | ✅ | ✅ |
+| 1 | `mal.state`, `mal.bus` | ✅ | ❌ excluded |
+| 2 | `mal.tabs`, `mal.onPush` | ⚠️ partial | ❌ excluded |
+| 3 | hidden tabs, raw CDP, the agent | ❌ | ❌ |
+
+**Publish extension** on a bubble emits one MV3 extension spanning every site it
+covers. Three MV3 facts shape the output:
+
+- A MAIN-world content script **cannot** call `chrome.runtime.*`, so every message
+  hops MAIN → `postMessage` → ISOLATED → `chrome.runtime` → service worker.
+- The service worker is killed after ~30s idle, so it routes but holds no state;
+  state lives in `chrome.storage.local`.
+- `chrome.storage.onChanged` fires in every context, which is what replaces the
+  bubble server's SSE stream and keeps live updates working.
+
+The same edit source runs unmodified in both environments. Userscript export
+**excludes** cross-site edits rather than degrading them — there's no background
+context to relay through, and the generated script is `@grant none`, so no `GM_*`
+value store exists to fall back on either.
+
+Every publish returns a report naming what shipped, what was left out and why, and
+where the artifact only approximates the browser. Tier 2 is partial: `mal.tabs`
+works, but `onPush` handlers have no driver, because the orchestrator lives here.
+
+**Tier 3 is the honest differentiator.** Tiers 1 and 2 *are* expressible in an
+extension — that took real codegen but it isn't special. What no extension or
+userscript can do is hidden worker tabs on arbitrary origins, raw CDP reach into a
+live page, and authoring any of it conversationally against the real page with no
+manifest declared up front and no store review.
 
 ### Beyond the tool menu: a raw CDP escape hatch
 

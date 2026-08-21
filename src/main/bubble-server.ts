@@ -10,7 +10,19 @@ type Log = (level: 'debug' | 'info' | 'warn' | 'error', event: string, data?: un
 export interface BubbleServerHandle {
   url: string
   token: string
+  /** Write a key as if from inside the bubble — used by push orchestration. */
+  setState: (bubbleId: string, key: string, value: unknown) => Promise<void>
+  getState: (bubbleId: string, key: string) => Promise<unknown>
   close: () => void
+}
+
+/** One tab, as a bubble member is allowed to see it: bubble hosts only. */
+export interface BubbleTab {
+  id: string
+  host: string
+  title: string
+  hidden: boolean
+  active: boolean
 }
 
 /** SSE subscriber, pinned to one bubble for its lifetime. */
@@ -46,9 +58,13 @@ const MAX_STATE_BYTES = 4 * 1024 * 1024
 export async function startBubbleServer(deps: {
   workspace: string
   bubbles: Bubbles
+  /** Tabs whose host is in this bubble. Never reveals tabs outside it. */
+  listBubbleTabs: (hosts: string[]) => BubbleTab[]
+  /** Open or focus a tab for a bubble host; returns its tab id. */
+  ensureTab: (host: string) => Promise<string | null>
   log: Log
 }): Promise<BubbleServerHandle> {
-  const { workspace, bubbles, log } = deps
+  const { workspace, bubbles, listBubbleTabs, ensureTab, log } = deps
   const token = randomUUID()
   const dir = join(workspace, '.malleable', 'surface')
   const watchers = new Set<Watcher>()
@@ -253,6 +269,29 @@ export async function startBubbleServer(deps: {
         }
       }
 
+      // ---- Tabs, scoped to the bubble ----
+      // Deliberately NOT an eval endpoint. Letting a page ask main to run code in
+      // a sibling tab would be a much larger grant than data sharing: because
+      // authorization is per-ORIGIN, a member site's own scripts could use it to
+      // execute code in another member's page. Push orchestration uses a state
+      // key instead, so each destination's own edit decides what to do.
+      if (req.method === 'GET' && url.pathname === '/tabs') {
+        const bubble = await bubbles.get(bubbleId)
+        send(res, 200, listBubbleTabs(bubble?.hosts ?? []), auth.origin)
+        return
+      }
+      if (req.method === 'POST' && url.pathname === '/tabs/ensure') {
+        const host = url.searchParams.get('host') ?? ''
+        const bubble = await bubbles.get(bubbleId)
+        if (!bubble || !bubble.hosts.includes(host)) {
+          send(res, 403, { error: 'Host is not in this bubble' }, auth.origin)
+          return
+        }
+        const id = await ensureTab(host)
+        send(res, 200, { ok: !!id, tab: id }, auth.origin)
+        return
+      }
+
       // ---- Ephemeral fan-out: never persisted, for live reactions ----
       if (req.method === 'POST' && url.pathname === '/publish') {
         const ch = url.searchParams.get('ch')
@@ -295,6 +334,14 @@ export async function startBubbleServer(deps: {
   return {
     url,
     token,
+    setState: async (bubbleId, key, value) => {
+      const data = { ...(await loadState(bubbleId)) }
+      if (value === null || value === undefined) delete data[key]
+      else data[key] = value
+      await saveState(bubbleId, data)
+      notify(bubbleId, { type: 'state', key, value: value ?? null })
+    },
+    getState: async (bubbleId, key) => (await loadState(bubbleId))[key],
     close: () => {
       for (const w of watchers) {
         try {

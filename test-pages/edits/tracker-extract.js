@@ -24,7 +24,7 @@ const readRows = () =>
 let lastSent = ''
 
 async function push(reason) {
-  const payload = { week: weekOf(), rows: readRows(), source: location.host, at: Date.now() }
+  const payload = { week: weekOf(), rows: readRows(), source: location.hostname, at: Date.now() }
   // Skip no-op writes so watchers on other sites don't churn.
   const sig = JSON.stringify(payload.rows)
   if (sig === lastSent) return

@@ -8,8 +8,9 @@ import { Checkpoints } from './checkpoint.js'
 import { Adaptations } from './adaptations.js'
 import { Bubbles } from './bubbles.js'
 import { startBubbleServer, type BubbleServerHandle } from './bubble-server.js'
+import { pushBubble } from './bubble-push.js'
 import { installCspRelaxation } from './csp.js'
-import { publishHostAsExtension } from './publish-extension.js'
+import { publishHostAsExtension, publishBubbleAsExtension } from './publish-extension.js'
 import { publishHostAsUserscript } from './publish-userscript.js'
 import { SessionStore } from './sessions.js'
 import { Logger } from './logger.js'
@@ -240,6 +241,40 @@ function malContext(): { endpoint: string; token: string; bubbleFor: (h: string,
     bubbleFor: (host, editId) => bubbles.bubbleForEdit(host, editId)
   }
 }
+
+/**
+ * Open (or focus) a tab for `host` and resolve only once its edits are injected —
+ * a push that lands before the destination's fill edit exists would be missed.
+ * Hidden worker tabs are never attached to the window.
+ */
+async function ensureTabForHost(host: string, hidden = false): Promise<string | null> {
+  const open = tabs.forHost(host).find((t) => t.hidden === hidden) ?? tabs.forHost(host)[0]
+  if (open) {
+    if (!open.hidden && !hidden) tabs.focus(open.id)
+    return open.id
+  }
+  if (hiddenTabCount() >= MAX_HIDDEN_TABS) {
+    logger.log('warn', 'bubble.hidden.capped', { host, cap: MAX_HIDDEN_TABS })
+    return null
+  }
+  const rec = tabs.create({ url: `https://${host}/`, background: true, hidden })
+  const wc = rec.view.webContents
+  await new Promise<void>((resolve) => {
+    let done = false
+    const finish = (): void => {
+      if (done) return
+      done = true
+      resolve()
+    }
+    // dom-ready is when the injector runs; give it a beat to finish applying.
+    wc.once('dom-ready', () => setTimeout(finish, 400))
+    setTimeout(finish, 12_000)
+  })
+  return rec.id
+}
+
+const MAX_HIDDEN_TABS = 4
+const hiddenTabCount = (): number => tabs.list().filter((t) => t.hidden).length
 
 /** Refresh the CSP allowlist + notify the renderer after any bubble change. */
 async function refreshBubbles(): Promise<void> {
@@ -534,9 +569,19 @@ function wireIpc(): void {
       throw err
     }
   })
+  ipcMain.handle(IPC.publishBubble, async (_e, id: string) => {
+    try {
+      const result = await publishBubbleAsExtension(adaptations, bubbles, WORKSPACE, id)
+      if (result.ok && result.zipPath) shell.showItemInFolder(result.zipPath)
+      return result
+    } catch (err) {
+      logger.log('error', 'publish.bubble.error', { id, err: String((err as any)?.message ?? err) })
+      throw err
+    }
+  })
   ipcMain.handle(IPC.publishUserscript, async (_e, host: string) => {
     try {
-      const result = await publishHostAsUserscript(adaptations, WORKSPACE, host)
+      const result = await publishHostAsUserscript(adaptations, WORKSPACE, host, bubbles)
       if (result.ok && result.filePath) shell.showItemInFolder(result.filePath)
       return result
     } catch (err) {
@@ -546,7 +591,7 @@ function wireIpc(): void {
   })
   ipcMain.handle(IPC.openInTampermonkey, async (_e, host: string) => {
     try {
-      const result = await publishHostAsUserscript(adaptations, WORKSPACE, host)
+      const result = await publishHostAsUserscript(adaptations, WORKSPACE, host, bubbles)
       if (!result.ok || !result.filePath) return result
       // Reveal the file so it's ready to drag onto Tampermonkey's dashboard tab
       // (its own supported install method — doesn't trip Chrome's "apps,
@@ -602,6 +647,23 @@ function wireIpc(): void {
       await refreshBubbles()
       reapplyForHost(host)
       return { ok: true }
+    }
+  )
+  // One action drives every destination in the bubble. No cross-tab code
+  // execution: main writes a push request, each destination's own edit answers.
+  ipcMain.handle(
+    IPC.pushBubble,
+    async (_e, id: string, opts?: { sourceHost?: string; hidden?: boolean }) => {
+      const bubble = await bubbles.get(id)
+      if (!bubble) return { ok: false, error: 'No such bubble', results: [] }
+      if (!bubbleServer) return { ok: false, error: 'Bubble server not running', results: [] }
+      return pushBubble(bubble, opts ?? {}, {
+        setState: (b, k, v) => bubbleServer!.setState(b, k, v),
+        getState: (b, k) => bubbleServer!.getState(b, k),
+        ensureTab: ensureTabForHost,
+        closeTab: (tabId) => void tabs.close(tabId),
+        log: (l, ev, d) => logger.log(l, ev, d)
+      })
     }
   )
   ipcMain.handle(IPC.bubbleConsentResponse, (_e, requestId: string, allow: boolean) => {
@@ -744,6 +806,18 @@ app.whenReady().then(async () => {
           return { ok: false as const, error: String((err as Error)?.message ?? err) }
         }
       },
+      pushBubble: async (id, opts) => {
+        const b = await bubbles.get(id)
+        if (!b) return { ok: false, error: 'No such bubble', results: [] }
+        if (!bubbleServer) return { ok: false, error: 'Bubble server not running', results: [] }
+        return pushBubble(b, opts, {
+          setState: (bid, k, v) => bubbleServer!.setState(bid, k, v),
+          getState: (bid, k) => bubbleServer!.getState(bid, k),
+          ensureTab: ensureTabForHost,
+          closeTab: (tabId) => void tabs.close(tabId),
+          log: (l, ev, d) => logger.log(l, ev, d)
+        })
+      },
       setEditBubble: async (host, editId, bubbleId) => {
         await bubbles.forgetEdit(host, editId)
         if (bubbleId) await bubbles.addEdit(bubbleId, { host, editId })
@@ -761,6 +835,19 @@ app.whenReady().then(async () => {
     bubbleServer = await startBubbleServer({
       workspace: WORKSPACE,
       bubbles,
+      // Only tabs whose host is in the bubble are ever revealed to a member.
+      listBubbleTabs: (hosts) =>
+        tabs
+          .list()
+          .filter((t) => hosts.includes(tabs.hostOf(t) ?? ''))
+          .map((t) => ({
+            id: t.id,
+            host: tabs.hostOf(t) ?? '',
+            title: t.view.webContents.isDestroyed() ? '' : t.view.webContents.getTitle(),
+            hidden: t.hidden,
+            active: t.id === tabs.activeId
+          })),
+      ensureTab: (host) => ensureTabForHost(host, false),
       log: (l, e, d) => logger.log(l, e, d)
     })
     await refreshBubbles()

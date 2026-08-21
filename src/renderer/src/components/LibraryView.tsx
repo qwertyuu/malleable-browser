@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { HostAdaptations, EditContent, ToolLibrary, ToolSummary } from '../../../shared/ipc'
+import type {
+  HostAdaptations,
+  EditContent,
+  ToolLibrary,
+  ToolSummary,
+  Bubble,
+  PublishReport
+} from '../../../shared/ipc'
 
 interface Props {
   visible: boolean
@@ -22,11 +29,57 @@ export default function LibraryView({ visible, busy, onAskAgent }: Props) {
   const [publishMsg, setPublishMsg] = useState<{ host: string; text: string; error?: boolean } | null>(
     null
   )
+  const [bubbles, setBubbles] = useState<Bubble[]>([])
+  const [bubbleBusy, setBubbleBusy] = useState<string | null>(null)
+  const [bubbleMsg, setBubbleMsg] = useState<{ id: string; text: string; error?: boolean; report?: PublishReport } | null>(null)
 
   const refresh = useCallback(async () => {
-    const [h, t] = await Promise.all([window.api.listAdaptations(), window.api.listTools()])
+    const [h, t, b] = await Promise.all([
+      window.api.listAdaptations(),
+      window.api.listTools(),
+      window.api.listBubbles()
+    ])
     setHosts(h)
     setTools(t)
+    setBubbles(b)
+  }, [])
+
+  /** Send the bubble's data to every destination site in it, in one action. */
+  const push = useCallback(async (b: Bubble) => {
+    setBubbleBusy(`${b.id}:push`)
+    setBubbleMsg(null)
+    try {
+      const res = await window.api.pushBubble(b.id, {})
+      setBubbleMsg({
+        id: b.id,
+        error: !res.ok,
+        text: res.ok
+          ? `Pushed ${res.entered ?? 0} ${res.entered === 1 ? 'entry' : 'entries'} — ` +
+            res.results.map((r) => `${r.host}: ${r.ok ? `${r.entered} ok` : (r.message ?? 'failed')}`).join(' · ')
+          : (res.error ?? res.results.map((r) => `${r.host}: ${r.message ?? 'failed'}`).join(' · '))
+      })
+    } finally {
+      setBubbleBusy(null)
+    }
+  }, [])
+
+  /** Cross-site edits export as one Chrome extension; a userscript can't relay. */
+  const publishBubble = useCallback(async (b: Bubble) => {
+    setBubbleBusy(`${b.id}:publish`)
+    setBubbleMsg(null)
+    try {
+      const res = await window.api.publishBubble(b.id)
+      setBubbleMsg({
+        id: b.id,
+        error: !res.ok,
+        text: res.ok ? `Published — ${res.zipPath}` : (res.error ?? 'Publish failed.'),
+        report: res.report
+      })
+    } catch (err) {
+      setBubbleMsg({ id: b.id, error: true, text: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setBubbleBusy(null)
+    }
   }, [])
 
   useEffect(() => {
@@ -184,6 +237,84 @@ export default function LibraryView({ visible, busy, onAskAgent }: Props) {
       {empty && (
         <div className="hint">
           Nothing yet. Reshape a page or let the agent build a tool from the Adapt tab.
+        </div>
+      )}
+
+      {bubbles.length > 0 && (
+        <div className="lib-host-group">
+          <div className="lib-host-name" style={{ cursor: 'default' }}>
+            ✦ Bubbles
+          </div>
+          <div className="hint" style={{ margin: '2px 0 8px' }}>
+            Groups of sites whose edits share data. Nothing leaves a bubble.
+          </div>
+          {bubbles.map((b) => (
+            <div key={b.id} className="bubble-row">
+              <div className="bubble-head">
+                <strong>{b.name}</strong>
+                <span className="bubble-hosts">{b.hosts.join(' · ')}</span>
+              </div>
+              <div className="bubble-meta">
+                {b.edits.length} edit{b.edits.length === 1 ? '' : 's'}
+              </div>
+              <div className="bubble-actions">
+                <button
+                  className="link-btn"
+                  disabled={busy || bubbleBusy !== null || b.hosts.length < 2}
+                  title={
+                    b.hosts.length < 2
+                      ? 'Needs at least two sites'
+                      : 'Open each destination and let its own edit fill it'
+                  }
+                  onClick={() => void push(b)}
+                >
+                  {bubbleBusy === `${b.id}:push` ? 'Pushing…' : 'Push to all'}
+                </button>
+                <button
+                  className="link-btn"
+                  disabled={bubbleBusy !== null}
+                  title="Export as one Chrome extension spanning every site in the bubble"
+                  onClick={() => void publishBubble(b)}
+                >
+                  {bubbleBusy === `${b.id}:publish` ? 'Publishing…' : 'Publish extension'}
+                </button>
+                <button
+                  className="link-btn danger"
+                  disabled={bubbleBusy !== null}
+                  onClick={async () => {
+                    if (!confirm(`Delete the "${b.name}" bubble? Its edits stay, but stop sharing data.`)) return
+                    await window.api.deleteBubble(b.id)
+                    void refresh()
+                  }}
+                >
+                  Delete
+                </button>
+              </div>
+              {bubbleMsg?.id === b.id && (
+                <div className={`bubble-msg ${bubbleMsg.error ? 'err' : ''}`}>
+                  <div>{bubbleMsg.text}</div>
+                  {bubbleMsg.report?.excluded.length ? (
+                    <div className="bubble-report">
+                      <strong>Left out:</strong>
+                      {bubbleMsg.report.excluded.map((x) => (
+                        <div key={`${x.host}:${x.name}`}>
+                          {x.name} ({x.host}) — {x.reason}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                  {bubbleMsg.report?.caveats.length ? (
+                    <div className="bubble-report">
+                      <strong>Differences outside this browser:</strong>
+                      {bubbleMsg.report.caveats.map((c) => (
+                        <div key={c}>{c}</div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
 

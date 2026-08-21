@@ -55,7 +55,10 @@ export function buildMalSource(args: {
         return r.json();
       });
   }
-  return {
+  // Built into a named object so callbacks can reference the API. Note that mal
+  // itself is NOT in scope here: this whole expression is the ARGUMENT that the
+  // edit wrapper receives, evaluated outside the wrapper function body.
+  var API={
     bubble:{id:B,name:${j(args.bubbleName)},hosts:${j(args.hosts)}},
     edit:${j(args.editId)},
     state:{
@@ -70,7 +73,27 @@ export function buildMalSource(args: {
       publish:function(ch,v){return req("POST","/publish"+qs("&ch="+encodeURIComponent(ch)),v===undefined?null:v)},
       subscribe:function(ch,fn){connect();(handlers.bus[ch]=handlers.bus[ch]||[]).push(fn);return function(){
         handlers.bus[ch]=(handlers.bus[ch]||[]).filter(function(f){return f!==fn})}}
-    }
+    },
+    tabs:{
+      list:function(){return req("GET","/tabs"+qs())},
+      ensure:function(host){return req("POST","/tabs/ensure"+qs("&host="+encodeURIComponent(host)))}
+    },
   };
+  // Push protocol: main writes __push, each destination's own edit answers with
+  // __result:<host>. Reporting back is handled here so an edit only has to do
+  // its own work and return a count.
+  API.onPush=function(fn){
+    return API.state.watch("__push",function(v){
+      if(!v||!v.id)return;
+      var host=location.hostname;
+      Promise.resolve()
+        .then(function(){return fn(v)})
+        .then(function(r){r=r||{};return API.state.set("__result:"+host,
+          {id:v.id,ok:r.ok!==false,entered:r.entered||0,failed:r.failed||0,message:r.message})})
+        .catch(function(e){return API.state.set("__result:"+host,
+          {id:v.id,ok:false,entered:0,failed:0,message:String(e&&e.message||e)})});
+    })
+  };
+  return API;
 })()`
 }

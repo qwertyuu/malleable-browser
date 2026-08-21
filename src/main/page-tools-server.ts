@@ -47,6 +47,11 @@ export interface PageToolsDeps {
   >
   /** Move an edit into a bubble, or out of all of them when null. */
   setEditBubble: (host: string, editId: string, bubbleId: string | null) => Promise<void>
+  /** Drive every destination in a bubble from one action. */
+  pushBubble: (
+    id: string,
+    opts: { sourceHost?: string; hidden?: boolean }
+  ) => Promise<unknown>
   listTabs: () => TabSummary[]
   openTab: (url: string, opts?: { background?: boolean; hidden?: boolean }) => string
   closeTab: (ref?: string) => boolean
@@ -115,7 +120,7 @@ interface BuiltServer {
 async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<BuiltServer> {
   const { adaptations, resolveInspector, currentUrl, reloadCurrent, reloadHost, log } = deps
   const { listTabs, openTab, closeTab, focusTab } = deps
-  const { bubbles, saveBubble, setEditBubble } = deps
+  const { bubbles, saveBubble, setEditBubble, pushBubble } = deps
   const server = new McpServer({ name: 'malleable-page', version: '0.1.0' })
   // name -> live registration. Global tools are always present; site tools track
   // the current host and are swapped as you navigate.
@@ -381,6 +386,27 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
       await reloadHost(h)
       return jsonResult({ ok: true, host: h, edit: id, bubble })
     }
+  )
+
+  server.registerTool(
+    'push_bubble',
+    {
+      description:
+        'Send the bubble\'s current data to EVERY destination site in it, in one action. ' +
+        'Opens or focuses a tab per destination, then each destination\'s own edit runs ' +
+        'its fill routine and reports back. Requires each destination to have an edit ' +
+        'using mal.onPush(...). Returns per-site counts.',
+      inputSchema: {
+        bubble: z.string().describe('bubble id'),
+        sourceHost: z.string().optional().describe('skip this host (where the data came from)'),
+        hidden: z
+          .boolean()
+          .optional()
+          .describe('drive destinations in hidden worker tabs, closed afterwards')
+      }
+    },
+    async ({ bubble, sourceHost, hidden }) =>
+      jsonResult(await pushBubble(bubble, { sourceHost, hidden }))
   )
 
   // ---- Meta-tools: let the agent grow its own toolset ----
