@@ -46,6 +46,10 @@ const MAX_BUFFER = 300
 const NETWORK_MAX_BUFFER = 400
 const MAX_BODY_LEN = 20_000
 const MAX_BODY_FETCH_BYTES = 256 * 1024
+// How long dom_query/run_js/dynamic tools wait for the page before giving up.
+// Doesn't cancel the underlying eval (Electron/V8 offers no way to interrupt a
+// synchronous script) — just stops the tool call from hanging the agent forever.
+const EVAL_TIMEOUT_MS = 20_000
 // Resource types whose bodies aren't useful to capture (binary/streaming).
 const SKIP_BODY_TYPES = new Set(['Image', 'Media', 'Font', 'WebSocket'])
 
@@ -64,6 +68,10 @@ export class PageInspector {
   // when the agent is actually asked to work on the page (see setCaptureEnabled),
   // not for ordinary browsing.
   private captureEnabled = false
+  // Electron's own hang detector (pings the renderer's main thread). Used to tell
+  // "stuck in an infinite loop / blocked by a dialog" apart from "just slow", and
+  // to decide whether stopPage() needs to crash-and-respawn the renderer.
+  private responsive = true
 
   constructor(
     private readonly getWc: () => WebContents | undefined,
@@ -110,6 +118,14 @@ export class PageInspector {
     })
 
     this.wireNetworkDebugger(wc)
+
+    this.responsive = true
+    wc.on('unresponsive', () => {
+      this.responsive = false
+    })
+    wc.on('responsive', () => {
+      this.responsive = true
+    })
 
     // Reset the console log on a real (main-frame, non-in-page) navigation; the
     // network log is a ring buffer that persists across reloads so the agent can
@@ -275,7 +291,29 @@ export class PageInspector {
   private async evaluate<T>(expr: string): Promise<T> {
     const wc = this.getWc()
     if (!wc) throw new Error('No page loaded')
-    return wc.executeJavaScript(expr, false) as Promise<T>
+    const evalPromise = wc.executeJavaScript(expr, false) as Promise<T>
+    let timer: NodeJS.Timeout
+    const timeout = new Promise<T>((_, reject) => {
+      timer = setTimeout(() => {
+        const hint = this.responsive
+          ? 'it may be stuck in an infinite loop or blocked by a dialog (alert/confirm/prompt)'
+          : 'the page has stopped responding'
+        reject(
+          new Error(
+            `Timed out after ${EVAL_TIMEOUT_MS / 1000}s waiting for the page — ${hint}. Try stop_page, then reload_page, to recover.`
+          )
+        )
+      }, EVAL_TIMEOUT_MS)
+    })
+    try {
+      return await Promise.race([evalPromise, timeout])
+    } finally {
+      clearTimeout(timer!)
+      // The eval itself can't be cancelled; swallow its eventual settlement so a
+      // late rejection (after we've already timed out) doesn't surface as an
+      // unhandled rejection.
+      evalPromise.catch(() => {})
+    }
   }
 
   /** Query the DOM by CSS selector; returns element details. */
@@ -344,6 +382,22 @@ export class PageInspector {
       })
     }
     return entries.slice(-limit)
+  }
+
+  /**
+   * Recover a hung page. If Electron's hang detector has already flagged the
+   * renderer unresponsive, stop() can't reach it (its JS thread is wedged and
+   * won't process the IPC) — so crash and let reload_page respawn it. Otherwise
+   * just stop the current load/script, same as a browser's stop button.
+   */
+  stopPage(): void {
+    const wc = this.getWc()
+    if (!wc) return
+    if (!this.responsive) {
+      wc.forcefullyCrashRenderer()
+    } else {
+      wc.stop()
+    }
   }
 
   /** PNG screenshot of the visible page, as base64. */

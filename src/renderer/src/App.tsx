@@ -173,7 +173,7 @@ export default function App() {
       const sid = currentId
       if (!sid) return
       setTab('adapt')
-      appendTo(sid, { kind: 'user', text: `[${host}] ${text}` })
+      appendTo(sid, { kind: 'user', text })
       setBusyMap((prev) => ({ ...prev, [sid]: true }))
       const res = await window.api.adaptHost(sid, host, text)
       setBusyMap((prev) => ({ ...prev, [sid]: false }))
@@ -299,9 +299,13 @@ export default function App() {
 // Streaming text chunks of the same kind are coalesced into one bubble, and all
 // updates for a given tool call collapse into a single, progressively-filled row.
 function mergeUpdate(prev: AdaptUpdate[], u: AdaptUpdate): AdaptUpdate[] {
+  // The renderer adds the user's message optimistically, then ACP echoes it.
+  // Keep one row for a live turn while still accepting identical historical turns.
+  const last = prev[prev.length - 1]
+  if (u.kind === 'user' && last?.kind === 'user' && u.text === last.text) return prev
+
   // Coalesce streaming agent/thought text.
   const streamy = u.kind === 'agent' || u.kind === 'thought'
-  const last = prev[prev.length - 1]
   if (streamy && last && last.kind === u.kind && u.text) {
     const copy = prev.slice(0, -1)
     copy.push({ ...last, text: (last.text ?? '') + u.text })

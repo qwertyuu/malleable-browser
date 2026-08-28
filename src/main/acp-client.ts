@@ -199,11 +199,21 @@ const QUIET_UPDATES = new Set([
 
 function sumTokens(usage: any): number | undefined {
   if (!usage) return undefined
-  const t = usage.totalTokens ?? usage.total_tokens
+  // codex-acp reports the currently occupied context as `used` (and its
+  // capacity as `size`), while other ACP adapters use the standard fields.
+  const t = usage.used ?? usage.totalTokens ?? usage.total_tokens
   if (typeof t === 'number') return t
   const sum =
     (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0) + (usage.cachedReadTokens ?? 0)
   return sum || undefined
+}
+
+/** Hide the browser's internal page-adaptation envelope from the chat transcript. */
+function displayUserMessage(content: unknown): string {
+  const text = textOf(content) ?? ''
+  const marker = '\nUser request: '
+  const start = text.lastIndexOf(marker)
+  return start >= 0 ? text.slice(start + marker.length).trim() : text
 }
 
 /** Extract the select-type config options (model, mode, …) for the UI. */
@@ -740,7 +750,7 @@ export class AcpClient {
   private normalize(update: any): AdaptUpdate {
     switch (update?.sessionUpdate) {
       case 'user_message_chunk':
-        return { kind: 'user', text: textOf(update.content) }
+        return { kind: 'user', text: displayUserMessage(update.content) }
       case 'agent_message_chunk':
         return { kind: 'agent', text: textOf(update.content) }
       case 'agent_thought_chunk':

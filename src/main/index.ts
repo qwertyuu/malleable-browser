@@ -161,6 +161,53 @@ async function capturePage(): Promise<{ url: string; title: string } | null> {
   }
 }
 
+/** Execute one adaptation turn after its target page/site has been resolved. */
+async function runAdaptation(target: {
+  sessionId: string
+  host: string
+  url: string
+  title: string
+  text: string
+  live?: boolean
+  startEvent: string
+  resultEvent: string
+}): Promise<AdaptResult> {
+  const client = acp
+  if (!client) return { ok: false, error: 'ACP not started' }
+
+  if (!safeMode) pageInspector.setCaptureEnabled(contentView?.webContents, true)
+  const statusBefore = await checkpoints.status()
+  if (target.sessionId) {
+    await sessions.setTitleIfDefault(target.sessionId, target.text)
+    sendToChrome(EVT.sessions, sessions.list())
+  }
+
+  logger.log('info', target.startEvent, {
+    sessionId: target.sessionId,
+    host: target.host,
+    url: target.url,
+    request: target.text
+  })
+  const prompt = adaptations.buildPrompt({
+    url: target.url,
+    title: target.title,
+    host: target.host,
+    edits: await adaptations.listForHost(target.host),
+    request: target.text,
+    persona: await loadPersona(WORKSPACE),
+    live: target.live
+  })
+  const res = await client.prompt(target.sessionId, prompt)
+
+  const treeChanged = (await checkpoints.status()) !== statusBefore
+  const checkpoint = treeChanged
+    ? ((await checkpoints.commitArtifacts(`${target.host}: ${target.text.slice(0, 60)}`)) ?? undefined)
+    : undefined
+  void emitNavState()
+  logger.log('info', target.resultEvent, { host: target.host, ok: !res.error, treeChanged, checkpoint })
+  return { ok: !res.error, stopReason: res.stopReason, error: res.error, checkpoint }
+}
+
 function createContentView(): void {
   // Sandboxed view for arbitrary/untrusted web content. It has NO preload and no
   // Node access — Claude's file/terminal power lives in the main process only and
@@ -292,41 +339,20 @@ function wireIpc(): void {
 
   // ---- The malleability loop: adapt the CURRENT PAGE ----
   ipcMain.handle(IPC.adaptPrompt, async (_e, sessionId: string, text: string): Promise<AdaptResult> => {
-    if (!acp) return { ok: false, error: 'ACP not started' }
     const page = await capturePage()
     if (!page) return { ok: false, error: 'No page loaded to adapt' }
     const slug = adaptations.slugFor(page.url)
     if (!slug) return { ok: false, error: 'This page has no adaptable origin' }
 
-    // Turn on CDP network/console capture now that the agent is actually about to
-    // work on this page (Safe Mode overrides this and keeps it off regardless).
-    if (!safeMode) pageInspector.setCaptureEnabled(contentView?.webContents, true)
-
-    const statusBefore = await checkpoints.status()
-    if (sessionId) {
-      await sessions.setTitleIfDefault(sessionId, text)
-      sendToChrome(EVT.sessions, sessions.list())
-    }
-    logger.log('info', 'adapt.request', { sessionId, host: slug, url: page.url, request: text })
-    // The agent inspects the live page and manages named edits via its MCP tools
-    // (save_adaptation etc.), which apply immediately. Main just checkpoints after.
-    const prompt = adaptations.buildPrompt({
+    return runAdaptation({
+      sessionId,
+      host: slug,
       url: page.url,
       title: page.title,
-      host: slug,
-      edits: await adaptations.listForHost(slug),
-      request: text,
-      persona: await loadPersona(WORKSPACE)
+      text,
+      startEvent: 'adapt.request',
+      resultEvent: 'adapt.result'
     })
-    const res = await acp.prompt(sessionId, prompt)
-
-    const treeChanged = (await checkpoints.status()) !== statusBefore
-    const checkpoint = treeChanged
-      ? ((await checkpoints.commitArtifacts(`${slug}: ${text.slice(0, 60)}`)) ?? undefined)
-      : undefined
-    void emitNavState()
-    logger.log('info', 'adapt.result', { host: slug, ok: !res.error, treeChanged, checkpoint })
-    return { ok: !res.error, stopReason: res.stopReason, error: res.error, checkpoint }
   })
   ipcMain.handle(IPC.adaptCancel, async (_e, sessionId: string) => acp?.cancel(sessionId))
   ipcMain.handle(IPC.newSession, async () => (acp ? acp.newSession() : { ok: false }))
@@ -335,34 +361,17 @@ function wireIpc(): void {
   ipcMain.handle(
     IPC.adaptHost,
     async (_e, sessionId: string, host: string, text: string): Promise<AdaptResult> => {
-      if (!acp) return { ok: false, error: 'ACP not started' }
-      // Same lazy capture-on as adaptPrompt — only instrument the page once the
-      // agent is actually asked to work on it.
-      if (!safeMode) pageInspector.setCaptureEnabled(contentView?.webContents, true)
-      const statusBefore = await checkpoints.status()
-      if (sessionId) {
-        await sessions.setTitleIfDefault(sessionId, text)
-        sendToChrome(EVT.sessions, sessions.list())
-      }
-      logger.log('info', 'adapt.host', { sessionId, host, request: text })
       const onCurrent = adaptations.slugFor(contentView?.webContents.getURL() ?? '') === host
-      const prompt = adaptations.buildPrompt({
+      return runAdaptation({
+        sessionId,
+        host,
         url: onCurrent ? (contentView?.webContents.getURL() ?? '') : `https://${host}/`,
         title: host,
-        host,
-        edits: await adaptations.listForHost(host),
-        request: text,
-        persona: await loadPersona(WORKSPACE),
-        live: onCurrent
+        text,
+        live: onCurrent,
+        startEvent: 'adapt.host',
+        resultEvent: 'adapt.host.result'
       })
-      const res = await acp.prompt(sessionId, prompt)
-      const treeChanged = (await checkpoints.status()) !== statusBefore
-      const checkpoint = treeChanged
-        ? ((await checkpoints.commitArtifacts(`${host}: ${text.slice(0, 60)}`)) ?? undefined)
-        : undefined
-      void emitNavState()
-      logger.log('info', 'adapt.host.result', { host, ok: !res.error, treeChanged, checkpoint })
-      return { ok: !res.error, stopReason: res.stopReason, error: res.error, checkpoint }
     }
   )
 

@@ -119,7 +119,7 @@ export interface AdaptUpdate {
 export interface Activity {
   state: 'idle' | 'thinking' | 'responding' | 'tool'
   detail?: string
-  /** Cumulative tokens for the current turn, from usage_update. */
+  /** Token usage reported by the active adapter, from usage_update. */
   tokens?: number
 }
 

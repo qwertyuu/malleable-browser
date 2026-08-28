@@ -138,7 +138,7 @@ export default function AdaptPanel(props: Props) {
         </span>
         {busy && <span className="metric" title="Elapsed">{(elapsed / 1000).toFixed(1)}s</span>}
         {activity.tokens != null && (
-          <span className="metric" title="Tokens this turn">{formatTokens(activity.tokens)}</span>
+          <span className="metric" title="Reported context usage">{formatTokens(activity.tokens)}</span>
         )}
         {currentModel && <span className="model-chip" title="Current model">{currentModel}</span>}
       </div>

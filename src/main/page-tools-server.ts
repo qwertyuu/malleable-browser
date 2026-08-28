@@ -183,6 +183,30 @@ async function buildServer(deps: PageToolsDeps, dynamic: DynamicTools): Promise<
     })
   )
   server.registerTool(
+    'stop_page',
+    {
+      description:
+        'Stop a hung page: aborts the current load and any wedged in-page script. Use this ' +
+        'when run_js/dom_query time out or the page stops responding, then call reload_page.',
+      inputSchema: {}
+    },
+    async () => {
+      inspector.stopPage()
+      return jsonResult({ ok: true })
+    }
+  )
+  server.registerTool(
+    'reload_page',
+    {
+      description: 'Reload the current page. Pair with stop_page to recover from a stuck/unresponsive page.',
+      inputSchema: {}
+    },
+    async () => {
+      await reloadCurrent()
+      return jsonResult({ ok: true })
+    }
+  )
+  server.registerTool(
     'fetch_image',
     { description: 'Download an image by URL and view it (multimodal).', inputSchema: { url: z.string() } },
     async ({ url }) => {

@@ -31,6 +31,13 @@ export default defineConfig({
         input: { index: resolve(__dirname, 'src/renderer/index.html') }
       }
     },
+    server: {
+      // Default 5173 (and neighboring ports through ~5202) falls inside a Windows
+      // dynamic port exclusion range reserved by Hyper-V/WSL's winnat service on
+      // some machines, which makes bind() fail with EACCES. 5000 is outside it.
+      host: '127.0.0.1',
+      port: 5000
+    },
     plugins: [react()]
   }
 })
