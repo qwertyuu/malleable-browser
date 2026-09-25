@@ -34,6 +34,16 @@ export class Bubbles {
     return slug || 'bubble'
   }
 
+  /**
+   * A name whose id is not taken yet: `base`, then `base 2`, `base 3`… Saving
+   * under a taken id would silently overwrite that bubble's hosts.
+   */
+  async availableName(base: string): Promise<string> {
+    let name = base
+    for (let n = 2; await this.get(this.idFor(name)); n++) name = `${base} ${n}`
+    return name
+  }
+
   private fileFor(id: string): string {
     return join(this.root, `${id}.json`)
   }

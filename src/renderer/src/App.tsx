@@ -227,6 +227,12 @@ export default function App() {
     void window.api.setSafeMode(!safeMode)
   }, [safeMode])
 
+  // The page view is a native layer above the chrome: hide it while the consent
+  // dialog is up, or the dialog renders underneath the page.
+  useEffect(() => {
+    void window.api.setPageObscured(consent !== null)
+  }, [consent])
+
   const answerConsent = useCallback((allow: boolean) => {
     setConsents((prev) => {
       const [head, ...rest] = prev
@@ -247,10 +253,14 @@ export default function App() {
     <div className="app">
       <TabStrip
         tabs={tabsState.tabs}
+        bubbles={bubbles}
         activeId={tabsState.activeId}
         onSelect={(id) => window.api.focusTab(id)}
         onClose={(id) => window.api.closeTab(id)}
+        onContextMenu={(id) => window.api.showTabMenu(id)}
         onNew={() => window.api.newTab()}
+        onBubbleMenu={(id) => window.api.showBubbleMenu(id)}
+        onNewBubble={() => window.api.startBubbleFromTab(tabsState.activeId ?? undefined)}
       />
       <Chrome
         nav={nav}

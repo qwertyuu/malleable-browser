@@ -47,6 +47,8 @@ export class TabManager {
   private activeIdValue: string | null = null
   private bounds: Rect = { x: 0, y: 0, width: 0, height: 0 }
   private counter = 0
+  /** A chrome modal is up: the page view would paint over it, so hide it. */
+  private obscured = false
 
   constructor(private readonly deps: TabManagerDeps) {}
 
@@ -212,6 +214,12 @@ export class TabManager {
     this.applyLayout()
   }
 
+  setObscured(obscured: boolean): void {
+    if (this.obscured === obscured) return
+    this.obscured = obscured
+    this.applyLayout()
+  }
+
   /**
    * All visible tabs stay attached and share the content rect; switching is a
    * visibility toggle (Electron 43 View.setVisible) rather than attach/detach
@@ -221,7 +229,7 @@ export class TabManager {
     for (const t of this.tabs.values()) {
       if (t.hidden) continue
       t.view.setBounds(this.bounds)
-      t.view.setVisible(t.id === this.activeIdValue)
+      t.view.setVisible(!this.obscured && t.id === this.activeIdValue)
     }
   }
 

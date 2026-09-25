@@ -17,6 +17,14 @@ export const IPC = {
   newTab: 'browser:newTab',
   closeTab: 'browser:closeTab',
   focusTab: 'browser:focusTab',
+  /** Right-click on a tab: main pops the native tab menu (bubble actions). */
+  showTabMenu: 'browser:showTabMenu',
+  /** Click on a bubble chip in the strip: main pops that bubble's menu. */
+  showBubbleMenu: 'bubble:showMenu',
+  /** Start a bubble from a tab's site (omitted tabId = the active tab). */
+  startBubbleFromTab: 'bubble:startFromTab',
+  /** A chrome modal is open: hide the page view, which would paint over it. */
+  setPageObscured: 'browser:setPageObscured',
 
   // The malleability loop.
   adaptPrompt: 'acp:prompt',

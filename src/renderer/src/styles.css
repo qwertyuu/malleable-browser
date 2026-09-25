@@ -150,6 +150,81 @@ body {
   font-size: 15px;
 }
 
+.tab-new-bubble {
+  font-size: 12px;
+}
+
+.tab-new-bubble:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* ---- Bubble groups in the tab strip (chip + its tabs, one color) ---- */
+.bubble-group {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* The group frame: only for a bubble with 2+ sites, where data can flow. */
+.bubble-group.sharing {
+  padding: 2px 2px 0;
+  border-top: 2px solid var(--bubble-color);
+  border-radius: 8px 8px 0 0;
+  background: color-mix(in srgb, var(--bubble-color) 12%, transparent);
+}
+
+.bubble-chip {
+  -webkit-app-region: no-drag;
+  flex: 0 0 auto;
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 140px;
+  padding: 3px 8px;
+  border: 1px solid var(--bubble-color);
+  border-radius: 999px;
+  background: var(--bubble-color);
+  color: #14141c;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* One site only, or no tab open: still shown, but visibly dormant. */
+.bubble-chip.dormant {
+  border-style: dashed;
+  background: transparent;
+  color: var(--bubble-color);
+}
+
+.bubble-chip:hover {
+  filter: brightness(1.12);
+}
+
+.bubble-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bubble-chip-count {
+  flex: 0 0 auto;
+  font-weight: 600;
+  opacity: 0.75;
+}
+
+/* A tab whose site is also in other bubbles than the group it sits in. */
+.tab-bubble-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
 /* ---- Toolbar / chrome ---- */
 .toolbar {
   display: flex;

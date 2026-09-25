@@ -15,6 +15,7 @@ import { publishHostAsUserscript } from './publish-userscript.js'
 import { SessionStore } from './sessions.js'
 import { Logger } from './logger.js'
 import { TabManager, type TabRecord } from './tabs.js'
+import { showTabContextMenu, showBubbleChipMenu } from './tab-menu.js'
 import { startPageToolsServer, type PageToolsHandle } from './page-tools-server.js'
 import { startCdpBridge, type CdpBridgeHandle } from './cdp-bridge.js'
 import { DynamicTools } from './dynamic-tools.js'
@@ -284,6 +285,81 @@ async function refreshBubbles(): Promise<void> {
   sendToChrome(EVT.bubbles, all)
 }
 
+/**
+ * The one path that creates or grows a bubble: consent for any new host, then
+ * save and re-run every member page. Resolves null when the user declines;
+ * throws when the save breaks the one-bubble-per-edit invariant.
+ */
+async function saveBubbleWithConsent(input: {
+  id?: string
+  name: string
+  hosts: string[]
+}): Promise<Bubble | null> {
+  const added = await bubbles.hostsAddedBy(input.id, input.hosts)
+  if (added.length && !(await askBubbleConsent(input.id, input.name, added))) return null
+  const b = await bubbles.save(input)
+  await refreshBubbles()
+  // Membership changes what gets injected, so re-run every member page.
+  for (const h of b.hosts) reapplyForHost(h)
+  logger.log('info', 'bubble.save', { id: b.id, hosts: b.hosts })
+  return b
+}
+
+/** Log a failed chrome-initiated bubble change (menus are fire-and-forget). */
+function logBubbleMenuError(err: unknown): void {
+  logger.log('warn', 'bubbleMenu.error', { err: String((err as Error)?.message ?? err) })
+}
+
+/** A new bubble holding only `host`, named after it. */
+function startBubbleForHost(host: string): void {
+  void bubbles
+    .availableName(host)
+    .then((name) => saveBubbleWithConsent({ name, hosts: [host] }))
+    .catch(logBubbleMenuError)
+}
+
+function addHostToBubble(b: Bubble, host: string): void {
+  void saveBubbleWithConsent({ id: b.id, name: b.name, hosts: [...b.hosts, host] }).catch(
+    logBubbleMenuError
+  )
+}
+
+/** Open a background tab for each member site that isn't showing anywhere. */
+function openMissingBubbleSites(b: Bubble): void {
+  for (const h of b.hosts) {
+    if (tabs.forHost(h).some((t) => !t.hidden)) continue
+    tabs.create({ url: `https://${h}/`, background: true })
+  }
+}
+
+/** Right-click on a tab: start a bubble from its site, or add it to one. */
+async function openTabContextMenu(tabId: string): Promise<void> {
+  const tab = tabs.get(tabId)
+  if (!win || !tab) return
+  showTabContextMenu({
+    win,
+    host: tabs.hostOf(tab),
+    bubbles: await bubbles.list(),
+    startBubble: startBubbleForHost,
+    addToBubble: addHostToBubble
+  })
+}
+
+/** Click on a bubble chip: act on that bubble relative to the active tab. */
+async function openBubbleChipMenu(bubbleId: string): Promise<void> {
+  const b = await bubbles.get(bubbleId)
+  if (!win || !b) return
+  const active = tabs.active()
+  showBubbleChipMenu({
+    win,
+    bubble: b,
+    activeHost: active ? tabs.hostOf(active) : null,
+    missingHosts: b.hosts.filter((h) => !tabs.forHost(h).some((t) => !t.hidden)),
+    addActiveTab: (host) => addHostToBubble(b, host),
+    openMissingSites: () => openMissingBubbleSites(b)
+  })
+}
+
 /** Lightweight page identity. The agent pulls DOM/console/etc. via its tools. */
 async function capturePage(tab: TabRecord | undefined): Promise<{ url: string; title: string } | null> {
   const wc = tab?.view.webContents
@@ -358,6 +434,16 @@ function wireIpc(): void {
   })
   ipcMain.handle(IPC.focusTab, (_e, tabId: string) => {
     tabs.focus(tabId)
+  })
+  ipcMain.handle(IPC.showTabMenu, (_e, tabId: string) => openTabContextMenu(tabId))
+  ipcMain.handle(IPC.showBubbleMenu, (_e, bubbleId: string) => openBubbleChipMenu(bubbleId))
+  ipcMain.handle(IPC.startBubbleFromTab, (_e, tabId?: string) => {
+    const tab = tabId ? tabs.get(tabId) : tabs.active()
+    const host = tab ? tabs.hostOf(tab) : null
+    if (host) startBubbleForHost(host)
+  })
+  ipcMain.handle(IPC.setPageObscured, (_e, obscured: boolean) => {
+    tabs.setObscured(obscured)
   })
 
   // Safe Mode: drop the automation fingerprint for the current page (CDP debugger,
@@ -618,16 +704,8 @@ function wireIpc(): void {
   ipcMain.handle(
     IPC.saveBubble,
     async (_e, input: { id?: string; name: string; hosts: string[] }) => {
-      const added = await bubbles.hostsAddedBy(input.id, input.hosts)
-      if (added.length && !(await askBubbleConsent(input.id, input.name, added))) {
-        return { ok: false, error: 'Declined' }
-      }
-      const b = await bubbles.save(input)
-      await refreshBubbles()
-      // Membership changes what gets injected, so re-run every member page.
-      for (const h of b.hosts) reapplyForHost(h)
-      logger.log('info', 'bubble.save', { id: b.id, hosts: b.hosts })
-      return { ok: true, bubble: b }
+      const b = await saveBubbleWithConsent(input)
+      return b ? { ok: true, bubble: b } : { ok: false, error: 'Declined' }
     }
   )
   ipcMain.handle(IPC.deleteBubble, async (_e, id: string) => {
@@ -793,14 +871,9 @@ app.whenReady().then(async () => {
       reloadHost,
       bubbles,
       saveBubble: async (input) => {
-        const added = await bubbles.hostsAddedBy(input.id, input.hosts)
-        if (added.length && !(await askBubbleConsent(input.id, input.name, added))) {
-          return { ok: false as const, error: 'the user declined' }
-        }
         try {
-          const b = await bubbles.save(input)
-          await refreshBubbles()
-          for (const h of b.hosts) reapplyForHost(h)
+          const b = await saveBubbleWithConsent(input)
+          if (!b) return { ok: false as const, error: 'the user declined' }
           return { ok: true as const, id: b.id }
         } catch (err) {
           return { ok: false as const, error: String((err as Error)?.message ?? err) }

@@ -43,6 +43,13 @@ const api = {
   newTab: (url?: string): Promise<void> => ipcRenderer.invoke(IPC.newTab, url),
   closeTab: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.closeTab, tabId),
   focusTab: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.focusTab, tabId),
+  showTabMenu: (tabId: string): Promise<void> => ipcRenderer.invoke(IPC.showTabMenu, tabId),
+  showBubbleMenu: (bubbleId: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.showBubbleMenu, bubbleId),
+  startBubbleFromTab: (tabId?: string): Promise<void> =>
+    ipcRenderer.invoke(IPC.startBubbleFromTab, tabId),
+  setPageObscured: (obscured: boolean): Promise<void> =>
+    ipcRenderer.invoke(IPC.setPageObscured, obscured),
   onTabsState: (cb: (s: TabsState) => void) => subscribe(EVT.tabsState, cb),
 
   // Malleability loop. Prompts target an explicit session so a mid-turn thread
